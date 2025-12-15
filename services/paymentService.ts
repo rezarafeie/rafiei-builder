@@ -21,6 +21,9 @@ const ZARINPAL_MERCHANT_ID = 'd88e96b3-4dcb-4af9-a9d1-9d8755a37a91';
 
 const TETHERLAND_API_KEY = 'HMcNhotoQfk9d4mWipfQMa54axNogCmpVyWTgWZp';
 
+// 1 USD = 10 Credits
+const CREDITS_PER_USD = 10;
+
 // Cache rate for 5 minutes to avoid rate limits
 let cachedRate: number | null = null;
 let lastFetchTime = 0;
@@ -137,7 +140,11 @@ export const paymentService = {
      */
     async requestZarinpalPayment(amountCredits: number, userEmail: string, userMobile?: string): Promise<string> {
         const tomanRate = await this.getUsdToIrrRate();
-        const amountToman = Math.ceil(amountCredits * tomanRate);
+        
+        // Calculate Toman Amount based on 1 USD = 10 Credits
+        // amountCredits = 10 -> needs 1 USD -> tomanRate * 1
+        // amountCredits = 1 -> needs 0.1 USD -> tomanRate * 0.1
+        const amountToman = Math.ceil(amountCredits * (tomanRate / CREDITS_PER_USD));
         const amountRial = amountToman * 10; // Zarinpal requires Rial
 
         const callbackUrl = `${window.location.origin}/#/payment/verify`;

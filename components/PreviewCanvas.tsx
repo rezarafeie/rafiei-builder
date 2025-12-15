@@ -1,16 +1,19 @@
 
 import React, { useEffect, useRef, useState, useMemo } from 'react';
-import { GeneratedCode } from '../types';
+import { GeneratedCode, ProjectFile } from '../types';
 import { constructFullDocument } from '../utils/codeGenerator';
-import { Loader2, RefreshCw, Eye } from 'lucide-react';
+import { Loader2, RefreshCw, Eye, ExternalLink } from 'lucide-react';
 
 interface PreviewCanvasProps {
   code: GeneratedCode | null;
+  files?: ProjectFile[];
   className?: string;
   isGenerating?: boolean;
   isUpdating?: boolean;
   onRuntimeError?: (error: string) => void;
   projectId?: string; // Optional: Used for context-aware routing injection
+  active?: boolean; // Optimization: Pause updates when hidden
+  externalUrl?: string; // Optional: External deployment URL (Vercel)
 }
 
 const loadingMessages = [
@@ -39,20 +42,38 @@ const fixingMessages = [
   "Re-calibrating the flux capacitor..."
 ];
 
-const PreviewCanvas: React.FC<PreviewCanvasProps> = ({ code, className, isGenerating = false, isUpdating = false, onRuntimeError, projectId }) => {
+// Simple hash for content
+const hashCode = (s: string) => {
+    let h = 0, i = 0;
+    if (s.length > 0)
+        while (i < s.length)
+            h = (h << 5) - h + s.charCodeAt(i++) | 0;
+    return h;
+};
+
+const PreviewCanvas: React.FC<PreviewCanvasProps> = ({ code, files, className, isGenerating = false, isUpdating = false, onRuntimeError, projectId, active = true, externalUrl }) => {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [reloadKey, setReloadKey] = useState(0);
   const [hasRuntimeError, setHasRuntimeError] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [showErrorDetails, setShowErrorDetails] = useState(false);
   
-  // Memoize document string to prevent unnecessary iframe reloads if code object identity changes but content is same
+  // Memoize document string to prevent unnecessary iframe reloads
   const docString = useMemo(() => {
+      // Prioritize external URL if available and NOT generating
+      if (externalUrl && !isGenerating && !isUpdating) return null;
+
+      if (files && files.length > 0) {
+          return constructFullDocument({ html: '', javascript: '', css: '', explanation: '' }, projectId, files);
+      }
       if (code && (code.html || code.javascript)) {
           return constructFullDocument(code, projectId);
       }
       return null;
-  }, [code?.html, code?.javascript, code?.css, projectId]);
+  }, [code, files, projectId, externalUrl, isGenerating, isUpdating]);
+
+  // Compute a content hash to force updates if content changes
+  const contentHash = useMemo(() => docString ? hashCode(docString) : 0, [docString]);
 
   // Pick a random message when the error state changes
   const activeFixingMessage = useMemo(() => {
@@ -73,118 +94,47 @@ const PreviewCanvas: React.FC<PreviewCanvasProps> = ({ code, className, isGenera
   }, [onRuntimeError]);
 
   useEffect(() => {
+    // Optimization: Skip updates if not active (e.g. hidden mobile tab)
+    if (!active) return;
+
     // Reset error state and start loading
     setHasRuntimeError(false);
     setShowErrorDetails(false);
     setIsLoading(true);
 
     if (iframeRef.current) {
-        if (docString) {
+        if (externalUrl && !isGenerating && !isUpdating) {
+            // USE VERCEL PREVIEW
+            if (iframeRef.current.src !== externalUrl) {
+                iframeRef.current.src = externalUrl;
+                iframeRef.current.removeAttribute('srcdoc');
+            } else {
+                setIsLoading(false); // Already on correct URL
+            }
+        } else if (docString) {
+            // USE LOCAL PREVIEW
             iframeRef.current.srcdoc = docString;
+            iframeRef.current.removeAttribute('src');
         } else if (isGenerating) {
-            iframeRef.current.srcdoc = `
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <style>
-                        body {
-                            display: flex;
-                            align-items: center;
-                            justify-content: center;
-                            height: 100vh;
-                            margin: 0;
-                            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';
-                            color: #94a3b8; /* Slate 400 */
-                            background-color: #0f172a; /* Slate 900 */
-                            overflow: hidden;
-                        }
-                        .container { 
-                            text-align: center; 
-                            animation: fadeIn 0.5s ease-out;
-                        }
-                        .loader {
-                            width: 48px;
-                            height: 48px;
-                            border: 4px solid #374151; /* Gray 700 */
-                            border-top-color: #6366f1; /* Indigo 500 */
-                            border-radius: 50%;
-                            display: inline-block;
-                            box-sizing: border-box;
-                            animation: rotation 1s linear infinite;
-                            margin-bottom: 24px;
-                        }
-                        h2 { 
-                            font-size: 1.25rem; 
-                            font-weight: 600; 
-                            color: #e2e8f0; /* Slate 200 */
-                            margin-bottom: 8px; 
-                            letter-spacing: -0.025em;
-                        }
-                        p { 
-                            font-size: 0.875rem; 
-                            max-width: 280px;
-                            min-height: 2.5em; /* Prevent layout shift */
-                            transition: opacity 0.4s ease-in-out;
-                        }
-                        @keyframes rotation {
-                            0% { transform: rotate(0deg); }
-                            100% { transform: rotate(360deg); }
-                        }
-                        @keyframes fadeIn {
-                            from { opacity: 0; transform: translateY(10px); }
-                            to { opacity: 1; transform: translateY(0); }
-                        }
-                    </style>
-                </head>
-                <body>
-                    <div class="container">
-                        <div class="loader"></div>
-                        <h2>Building your vision...</h2>
-                        <p id="loading-text">${loadingMessages[0]}</p>
-                    </div>
-                    <script>
-                        const messages = ${JSON.stringify(loadingMessages)};
-                        const p = document.getElementById('loading-text');
-                        let currentIndex = 0;
-
-                        const intervalId = setInterval(() => {
-                            // Pick a random index, but not the same as the current one
-                            let nextIndex;
-                            do {
-                                nextIndex = Math.floor(Math.random() * messages.length);
-                            } while (messages.length > 1 && nextIndex === currentIndex);
-                            
-                            currentIndex = nextIndex;
-                            
-                            p.style.opacity = 0;
-                            setTimeout(() => {
-                                p.textContent = messages[currentIndex];
-                                p.style.opacity = 1;
-                            }, 400); // Should match transition duration
-                        }, 2500);
-                    </script>
-                </body>
-                </html>
-            `;
+            iframeRef.current.srcdoc = `<!DOCTYPE html><html><body style="background:#0f172a;color:#94a3b8;display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;"><div>Building...</div></body></html>`;
+            iframeRef.current.removeAttribute('src');
         } else {
-            iframeRef.current.srcdoc = `
-                <!DOCTYPE html>
-                <html>
-                <body style="display:flex;align-items:center;justify-content:center;height:100vh;margin:0;font-family:sans-serif;color:#64748b;background:#f8fafc;">
-                    <div style="text-align:center;">
-                        <h2>Ready to Build</h2>
-                        <p>Describe your app in the chat to start generating.</p>
-                    </div>
-                </body>
-                </html>
-            `;
+            iframeRef.current.srcdoc = `<!DOCTYPE html><html><body style="background:#f8fafc;display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;color:#64748b;"><div>Ready to Build</div></body></html>`;
+            iframeRef.current.removeAttribute('src');
         }
     }
-  }, [docString, isGenerating, isUpdating, reloadKey]);
+  }, [docString, isGenerating, isUpdating, reloadKey, active, contentHash, externalUrl]);
 
   const handleReload = () => {
     setIsLoading(true);
-    setReloadKey(prev => prev + 1);
+    if (iframeRef.current && externalUrl && !isGenerating) {
+        // Force reload of external URL by appending/changing timestamp
+        const url = new URL(externalUrl);
+        url.searchParams.set('t', Date.now().toString());
+        iframeRef.current.src = url.toString();
+    } else {
+        setReloadKey(prev => prev + 1);
+    }
     setHasRuntimeError(false);
     setShowErrorDetails(false);
   };
@@ -192,7 +142,6 @@ const PreviewCanvas: React.FC<PreviewCanvasProps> = ({ code, className, isGenera
   return (
     <div className={`w-full h-full bg-[#0f172a] rounded-lg overflow-hidden shadow-xl border border-gray-700 relative group ${className}`}>
       
-      {/* Loading Bar Animation Style */}
       <style>
         {`
             @keyframes loading-scan {
@@ -206,26 +155,45 @@ const PreviewCanvas: React.FC<PreviewCanvasProps> = ({ code, className, isGenera
         `}
       </style>
 
-      {/* Top Loading Bar */}
       {(isLoading || isGenerating || isUpdating) && (
           <div className="absolute top-0 left-0 right-0 h-1 z-30 bg-transparent overflow-hidden pointer-events-none">
               <div className="w-full h-full loading-bar-shim"></div>
           </div>
       )}
 
-      {docString && !isGenerating && !isUpdating && (
-        <button 
-            onClick={handleReload}
-            className="absolute top-4 right-4 z-20 p-2 bg-slate-800/80 hover:bg-slate-700 text-slate-400 hover:text-white rounded-lg backdrop-blur-sm border border-slate-600/50 shadow-lg transition-all opacity-100 md:opacity-0 md:group-hover:opacity-100"
-            title="Reload Preview"
-        >
-            <RefreshCw size={16} />
-        </button>
+      {!isGenerating && !isUpdating && (
+        <div className="absolute top-4 right-4 z-20 flex gap-2">
+            {externalUrl && (
+                <a 
+                    href={externalUrl} 
+                    target="_blank" 
+                    rel="noopener noreferrer"
+                    className="p-2 bg-slate-800/80 hover:bg-slate-700 text-slate-400 hover:text-white rounded-lg backdrop-blur-sm border border-slate-600/50 shadow-lg transition-all opacity-100 md:opacity-0 md:group-hover:opacity-100"
+                    title="Open in new tab"
+                >
+                    <ExternalLink size={16} />
+                </a>
+            )}
+            <button 
+                onClick={handleReload}
+                className="p-2 bg-slate-800/80 hover:bg-slate-700 text-slate-400 hover:text-white rounded-lg backdrop-blur-sm border border-slate-600/50 shadow-lg transition-all opacity-100 md:opacity-0 md:group-hover:opacity-100"
+                title="Reload Preview"
+            >
+                <RefreshCw size={16} />
+            </button>
+        </div>
+      )}
+
+      {/* Deployment Status Indicator */}
+      {externalUrl && !isGenerating && !isUpdating && (
+          <div className="absolute bottom-4 right-4 z-20 px-3 py-1 bg-emerald-500/90 backdrop-blur-sm text-white text-xs font-bold rounded-full shadow-lg pointer-events-none opacity-50 group-hover:opacity-100 transition-opacity">
+              Live Preview
+          </div>
       )}
 
       <iframe
         ref={iframeRef}
-        key={reloadKey}
+        key={`${reloadKey}-${contentHash}`}
         title="App Preview"
         className="w-full h-full bg-white"
         sandbox="allow-scripts allow-modals allow-same-origin allow-forms allow-popups"
@@ -233,7 +201,6 @@ const PreviewCanvas: React.FC<PreviewCanvasProps> = ({ code, className, isGenera
         onLoad={() => setIsLoading(false)}
       />
       
-      {/* Show overlay ONLY if updating AND there is a runtime error we are trying to fix, and user hasn't dismissed it */}
       {isUpdating && hasRuntimeError && !showErrorDetails && (
         <div className="absolute inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex flex-col items-center justify-center text-white animate-in fade-in duration-200">
             <div className="flex flex-col items-center gap-4">

@@ -1,17 +1,19 @@
 
 import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { User, Project, SystemLog, AdminMetric, FinancialStats, CreditLedgerEntry, WebhookLog } from '../types';
-import { cloudService } from '../services/cloudService';
+import { User, Project, SystemLog, AdminMetric, FinancialStats, CreditLedgerEntry, WebhookLog, AIProviderConfig, AIProviderId } from '../types';
+import { cloudService, supabase } from '../services/cloudService';
 import { billingService } from '../services/billingService';
 import { webhookService, EventType } from '../services/webhookService';
+import { aiProviderService } from '../services/aiProviderService';
 import { PROMPT_KEYS, DEFAULTS } from '../services/geminiService';
 import SqlSetupModal from './SqlSetupModal';
 import { 
     Activity, Users, Box, Brain, AlertTriangle, Terminal, 
     Shield, Settings, RefreshCw, X, Database, Loader2, 
     DollarSign, TrendingUp, CreditCard, Check, Search, 
-    Clock, Calendar, FileText, ChevronRight, Save, Menu, Zap, Scale, BarChart3, Radio, Send
+    Clock, Calendar, FileText, ChevronRight, Save, Menu, Zap, Scale, BarChart3, Radio, Send, ToggleLeft, ToggleRight, Lock, Key, Filter,
+    FileJson, MessageSquare, Eye, EyeOff, Copy, ChevronLeft, ChevronRight as ArrowRightIcon, Trash2
 } from 'lucide-react';
 
 interface AdminPanelProps {
@@ -21,16 +23,65 @@ interface AdminPanelProps {
 
 type AdminView = 'dashboard' | 'financials' | 'users' | 'projects' | 'ai' | 'webhooks' | 'errors' | 'settings' | 'database';
 
+// Reusable Pagination Component
+const PaginationControls: React.FC<{ 
+    currentPage: number, 
+    totalItems: number, 
+    itemsPerPage: number, 
+    onPageChange: (p: number) => void 
+}> = ({ currentPage, totalItems, itemsPerPage, onPageChange }) => {
+    const totalPages = Math.ceil(totalItems / itemsPerPage);
+    if (totalPages <= 1) return null;
+
+    return (
+        <div className="flex items-center justify-between px-4 py-3 bg-slate-900/50 border-t border-slate-700/50">
+            <span className="text-xs text-slate-400">
+                Showing <span className="font-medium text-white">{(currentPage - 1) * itemsPerPage + 1}</span> to <span className="font-medium text-white">{Math.min(currentPage * itemsPerPage, totalItems)}</span> of <span className="font-medium text-white">{totalItems}</span> results
+            </span>
+            <div className="flex gap-1">
+                <button 
+                    onClick={() => onPageChange(currentPage - 1)} 
+                    disabled={currentPage === 1}
+                    className="p-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-400 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                    <ChevronLeft size={16} />
+                </button>
+                <button 
+                    onClick={() => onPageChange(currentPage + 1)} 
+                    disabled={currentPage === totalPages}
+                    className="p-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-400 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                    <ArrowRightIcon size={16} />
+                </button>
+            </div>
+        </div>
+    );
+};
+
 const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
     const [view, setView] = useState<AdminView>('dashboard');
+    
+    // Core Data States
     const [projects, setProjects] = useState<Project[]>([]);
     const [allUsers, setAllUsers] = useState<any[]>([]);
     const [stats, setStats] = useState<AdminMetric[]>([]);
     const [logs, setLogs] = useState<SystemLog[]>([]);
-    const [aiUsage, setAiUsage] = useState<any[]>([]);
     const [prompts, setPrompts] = useState<Record<string, string>>({});
+    
+    // Pagination State
+    const [currentPage, setCurrentPage] = useState(1);
+    const [totalItems, setTotalItems] = useState(0);
+    const ITEMS_PER_PAGE = 10;
+
     const [isLoading, setIsLoading] = useState(false);
     const [dataError, setDataError] = useState<string | null>(null);
+    const [isSavingPrompts, setIsSavingPrompts] = useState(false);
+    
+    // AI Provider State
+    const [aiConfigs, setAiConfigs] = useState<AIProviderConfig[]>([]);
+    const [editingProviderId, setEditingProviderId] = useState<AIProviderId | null>(null);
+    const [tempApiKey, setTempApiKey] = useState('');
+    const [aiFilter, setAiFilter] = useState<string>('all');
     
     // Financial State (Initialize with zeros)
     const [financialStats, setFinancialStats] = useState<FinancialStats>({
@@ -44,6 +95,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
         totalRequestCount: 0
     });
     const [ledger, setLedger] = useState<CreditLedgerEntry[]>([]);
+    const [selectedUsageLog, setSelectedUsageLog] = useState<CreditLedgerEntry | null>(null);
     const [newMargin, setNewMargin] = useState('');
     
     // Finance Ops State
@@ -65,95 +117,152 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
     const [showSqlWizard, setShowSqlWizard] = useState(false);
     const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
-    const loadData = async () => {
+    // Reset pagination when view changes
+    useEffect(() => {
+        setCurrentPage(1);
+        setDataError(null);
+        // We trigger data load via the next effect
+    }, [view]);
+
+    // Data Loading Effect
+    useEffect(() => {
+        loadViewData();
+    }, [view, currentPage]);
+
+    const loadViewData = async () => {
         setIsLoading(true);
         setDataError(null);
         try {
-            const [adminProjects, adminUsers, systemLogs] = await Promise.all([
-                cloudService.getAdminProjects(),
-                cloudService.getAdminUsers(),
-                cloudService.getSystemLogs()
-            ]);
-
-            setProjects(adminProjects);
-            setAllUsers(adminUsers);
-            setLogs(systemLogs);
-
-            // Fetch Financials - Use cloudService to ensure authenticated session
-            try {
+            // 1. Dashboard specific stats (lightweight counts usually, but simplified here)
+            if (view === 'dashboard') {
+                await loadDashboardStats();
+            }
+            
+            // 2. Paginated List Views
+            else if (view === 'projects') {
+                const { data, count } = await cloudService.getAdminProjects(currentPage, ITEMS_PER_PAGE);
+                setProjects(data);
+                setTotalItems(count);
+            }
+            else if (view === 'users') {
+                const { data, count } = await cloudService.getAdminUsers(currentPage, ITEMS_PER_PAGE);
+                setAllUsers(data);
+                setTotalItems(count);
+            }
+            else if (view === 'errors') {
+                const { data, count } = await cloudService.getSystemLogs(currentPage, ITEMS_PER_PAGE);
+                setLogs(data);
+                setTotalItems(count);
+            }
+            else if (view === 'financials') {
+                // Stats
                 const fStats = await cloudService.getFinancialStats();
-                const fLedger = await cloudService.getLedger(200); // Increased limit
                 if (fStats) {
                     setFinancialStats(fStats);
                     setNewMargin(fStats.currentMargin.toString());
                 }
-                setLedger(fLedger);
-            } catch (e) { 
-                console.warn("Financials load error (likely empty tables or RLS):", e); 
+                // Ledger (Paginated)
+                const { data, count } = await cloudService.getLedger(currentPage, ITEMS_PER_PAGE);
+                setLedger(data);
+                setTotalItems(count);
             }
-
-            // Metrics
-            const activeUsersCount = adminUsers.filter((u: any) => {
-                if (!u.last_sign_in_at) return false;
-                const diff = Date.now() - new Date(u.last_sign_in_at).getTime();
-                return diff < 7 * 24 * 60 * 60 * 1000;
-            }).length;
-
-            const failedBuilds = adminProjects.filter(p => p.status === 'failed' || p.buildState?.error).length;
-            const successRate = adminProjects.length > 0 
-                ? Math.round(((adminProjects.length - failedBuilds) / adminProjects.length) * 100) 
-                : 100;
-
-            const errorCount = systemLogs.filter(l => l.level === 'error' || l.level === 'critical').length;
-
-            setStats([
-                { label: 'Total Users', value: adminUsers.length, status: 'good' },
-                { label: 'Active Users (7d)', value: activeUsersCount, status: 'good' },
-                { label: 'Total Projects', value: adminProjects.length, status: 'good' },
-                { label: 'Build Success Rate', value: `${successRate}%`, status: successRate < 80 ? 'warning' : 'good' },
-                { label: 'Recent Errors', value: errorCount, status: errorCount > 5 ? 'critical' : 'good' },
-            ]);
-
-            // Load Prompts
-            const loadedPrompts: Record<string, string> = {};
-            Object.keys(PROMPT_KEYS).forEach(key => {
-                // @ts-ignore
-                const storageKey = PROMPT_KEYS[key];
-                // @ts-ignore
-                const defaultVal = DEFAULTS[key];
-                loadedPrompts[key] = localStorage.getItem(storageKey) || defaultVal;
-            });
-            setPrompts(loadedPrompts);
+            else if (view === 'webhooks') {
+                const url = await cloudService.getSystemSetting('webhook_url');
+                if (url) setWebhookUrl(url);
+                
+                const { data, count } = await cloudService.getWebhookLogs(currentPage, ITEMS_PER_PAGE);
+                setWebhookLogs(data);
+                setTotalItems(count);
+            }
+            else if (view === 'ai') {
+                // Not paginated usually, simplified logic
+                const configs = await aiProviderService.getAllConfigs();
+                setAiConfigs(configs);
+                
+                // Also load ledger for AI stats (using same as financials but maybe filtering needed later)
+                const { data, count } = await cloudService.getLedger(currentPage, ITEMS_PER_PAGE);
+                setLedger(data);
+                setTotalItems(count);
+            }
+            else if (view === 'settings') {
+                const promptKeys = Object.values(PROMPT_KEYS);
+                const { data: dbSettings } = await cloudService.getSystemSettings(promptKeys);
+                const dbPrompts: Record<string, string> = {};
+                if (dbSettings) dbSettings.forEach((s: any) => dbPrompts[s.key] = s.value);
+                const loadedPrompts: Record<string, string> = {};
+                Object.entries(PROMPT_KEYS).forEach(([key, storageKey]) => {
+                    const defaultVal = (DEFAULTS as Record<string, string>)[key] || '';
+                    loadedPrompts[key] = dbPrompts[storageKey] || defaultVal;
+                });
+                setPrompts(loadedPrompts);
+            }
 
         } catch (e: any) {
-            console.error("Admin load failed", e);
-            setDataError(e.message || "Failed to load admin data.");
-            if (e.message.includes("Access Denied") || e.message.includes("Missing")) {
-                setShowSqlWizard(true); 
-            }
+            console.error("View load failed", e);
+            setDataError(e.message);
+            if (e.message.includes("Access Denied")) setShowSqlWizard(true);
         } finally {
             setIsLoading(false);
         }
     };
 
-    const loadWebhookData = async () => {
+    const loadDashboardStats = async () => {
+        // Quick summary fetch
         try {
-            const url = await cloudService.getSystemSetting('webhook_url');
-            if (url) setWebhookUrl(url);
-            const wLogs = await cloudService.getWebhookLogs();
-            setWebhookLogs(wLogs);
-        } catch(e) { console.error(e); }
+            const { count: userCount } = await supabase.from('user_settings').select('user_id', { count: 'exact', head: true });
+            const { count: projectCount } = await supabase.from('projects').select('id', { count: 'exact', head: true });
+            
+            // Calculate active users
+            // This assumes getAdminUsers is efficient or we use a separate RPC for count
+            // For now, simple estimate from user_settings is enough for dashboard cards
+            
+            const fStats = await cloudService.getFinancialStats();
+            if (fStats) setFinancialStats(fStats);
+
+            setStats([
+                { label: 'Total Users', value: userCount || 0, status: 'good' },
+                { label: 'Total Projects', value: projectCount || 0, status: 'good' },
+                { label: 'Revenue (USD Est)', value: `$${fStats?.totalRevenueCredits ? (fStats.totalRevenueCredits/10).toFixed(2) : '0.00'}`, status: 'good' },
+            ]);
+        } catch(e) {}
     };
 
-    useEffect(() => {
-        loadData();
-    }, [user.id]);
+    // AI Config Handlers
+    const handleToggleActiveAI = async (config: AIProviderConfig) => {
+        try {
+            await aiProviderService.saveConfig({ id: config.id, isActive: !config.isActive });
+            const configs = await aiProviderService.getAllConfigs();
+            setAiConfigs(configs);
+        } catch(e:any) { alert(e.message); }
+    };
 
-    useEffect(() => {
-        if (view === 'webhooks') {
-            loadWebhookData();
-        }
-    }, [view]);
+    const handleToggleFallbackAI = async (config: AIProviderConfig) => {
+        try {
+            await aiProviderService.saveConfig({ id: config.id, isFallback: !config.isFallback });
+            const configs = await aiProviderService.getAllConfigs();
+            setAiConfigs(configs);
+        } catch(e:any) { alert(e.message); }
+    };
+
+    const handleUpdateModel = async (id: AIProviderId, model: string) => {
+        try {
+            await aiProviderService.saveConfig({ id, model });
+            const configs = await aiProviderService.getAllConfigs();
+            setAiConfigs(configs);
+        } catch(e:any) { alert(e.message); }
+    };
+
+    const handleSaveApiKey = async (id: AIProviderId) => {
+        if (!tempApiKey) return;
+        try {
+            await aiProviderService.saveConfig({ id, apiKey: tempApiKey });
+            setTempApiKey('');
+            setEditingProviderId(null);
+            const configs = await aiProviderService.getAllConfigs();
+            setAiConfigs(configs);
+            alert("API Key updated securely.");
+        } catch(e:any) { alert(e.message); }
+    };
 
     const handleUpdateMargin = async () => {
         const val = parseFloat(newMargin);
@@ -161,7 +270,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
         try {
             await billingService.updateProfitMargin(val);
             alert("Margin updated");
-            loadData();
+            loadViewData();
         } catch (e: any) { alert(e.message); }
     };
 
@@ -187,7 +296,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
             alert("Adjustment successful");
             setAdjustmentAmount('');
             setAdjustmentNote('');
-            loadData();
+            loadViewData();
             if (selectedUser && selectedUser.id === targetId) {
                 handleUserSelect(selectedUser);
             }
@@ -196,20 +305,56 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
         }
     };
 
-    const handleSavePrompt = (key: string, value: string) => {
-        // @ts-ignore
-        const storageKey = PROMPT_KEYS[key];
-        localStorage.setItem(storageKey, value);
-        setPrompts(prev => ({ ...prev, [key]: value }));
-        alert("System prompt updated locally.");
+    const handleSaveAllPrompts = async () => {
+        setIsSavingPrompts(true);
+        try {
+            const updates = Object.entries(prompts).map(([key, value]) => {
+                // @ts-ignore
+                const storageKey = PROMPT_KEYS[key];
+                return cloudService.setSystemSetting(storageKey, value);
+            });
+            await Promise.all(updates);
+            alert("All system prompts saved globally.");
+        } catch (e: any) {
+            alert("Failed to save prompts: " + e.message);
+        } finally {
+            setIsSavingPrompts(false);
+        }
     };
 
-    const handleResetPrompt = (key: string) => {
-        // @ts-ignore
-        const storageKey = PROMPT_KEYS[key];
-        localStorage.removeItem(storageKey);
-        // @ts-ignore
-        setPrompts(prev => ({ ...prev, [key]: DEFAULTS[key] }));
+    const handleResetPrompt = async (key: string) => {
+        const storageKey = (PROMPT_KEYS as Record<string, string>)[key];
+        try {
+            await supabase.from('system_settings').delete().eq('key', storageKey);
+            const defaultVal = (DEFAULTS as Record<string, string>)[key];
+            setPrompts(prev => ({ ...prev, [key]: defaultVal }));
+            alert("Reset to default (Global override removed).");
+        } catch(e: any) {
+            alert("Failed to reset: " + e.message);
+        }
+    };
+
+    const handleResetAllPrompts = async () => {
+        if (!window.confirm("Are you sure? This will remove ALL custom system prompts from the database and revert to the code defaults.")) return;
+        
+        setIsSavingPrompts(true);
+        try {
+            const keys = Object.values(PROMPT_KEYS);
+            await supabase.from('system_settings').delete().in('key', keys);
+            
+            // Reload defaults from code
+            const defaultPrompts: Record<string, string> = {};
+            Object.entries(PROMPT_KEYS).forEach(([key, storageKey]) => {
+                const defaultVal = (DEFAULTS as Record<string, string>)[key] || '';
+                defaultPrompts[key] = defaultVal;
+            });
+            setPrompts(defaultPrompts);
+            alert("All prompts reset to code defaults.");
+        } catch(e: any) {
+            alert("Failed to reset all: " + e.message);
+        } finally {
+            setIsSavingPrompts(false);
+        }
     };
 
     const handleSaveWebhookUrl = async () => {
@@ -226,41 +371,59 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
     const handleTestWebhook = async () => {
         await webhookService.send(testEventType, { message: "This is a test event from the Admin Panel" }, {}, user);
         alert("Test event fired. Check logs in a moment.");
-        setTimeout(loadWebhookData, 2000); // Refresh logs after a delay
+        // We wait a bit then refresh logs if we are on the webhooks view
+        if (view === 'webhooks') {
+            setTimeout(loadViewData, 2000); 
+        }
     };
 
     const handleNavClick = (newView: AdminView) => { setView(newView); setIsSidebarOpen(false); };
 
-    if (isLoading && stats.length === 0) {
-        return <div className="h-screen bg-[#0f172a] flex items-center justify-center text-white"><Loader2 className="animate-spin mr-2" /> Loading Admin Data...</div>;
-    }
+    // Analytics Helper Logic (Computed from loaded paginated ledger - note: this is partial data now for charts)
+    const getProviderFromModel = (m: string) => {
+        if (!m) return 'unknown';
+        const lower = m.toLowerCase();
+        if (lower.includes('gpt') || lower.includes('o1') || lower.includes('dall-e')) return 'openai';
+        if (lower.includes('claude')) return 'claude';
+        return 'google';
+    };
 
+    const filteredLedger = ledger.filter(entry => {
+        if (aiFilter === 'all') return true;
+        return getProviderFromModel(entry.model) === aiFilter;
+    });
+
+    const aiStats = filteredLedger.reduce((acc, curr) => {
+        acc.count += 1;
+        acc.inputTokens += Number(curr.inputTokens || 0);
+        acc.outputTokens += Number(curr.outputTokens || 0);
+        acc.cost += Number(curr.rawCostUsd || 0);
+        acc.credits += Number(curr.creditsDeducted || 0);
+        return acc;
+    }, { count: 0, inputTokens: 0, outputTokens: 0, cost: 0, credits: 0 });
+
+    const revenueUsd = aiStats.credits / 10;
+    const profitUsd = revenueUsd - aiStats.cost;
+
+    // --- User Detail Modal ---
     const UserDetailsModal = () => {
         if (!selectedUser) return null;
-        const userProjects = projects.filter(p => p.userId === selectedUser.id);
-        const userBalance = selectedUser.credits_balance !== undefined ? selectedUser.credits_balance : '...';
 
         return (
-            <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[60] flex items-center justify-center p-4 animate-in fade-in zoom-in-95">
-                <div className="bg-[#1e293b] border border-slate-700 rounded-2xl w-full max-w-5xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
+            <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[70] flex items-center justify-center p-4 animate-in fade-in zoom-in-95">
+                <div className="bg-[#1e293b] border border-slate-700 rounded-2xl w-full max-w-4xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
+                    {/* Header */}
                     <div className="p-6 border-b border-slate-700 flex justify-between items-start bg-[#0f172a]">
                         <div className="flex items-center gap-4">
-                            <div className="w-16 h-16 rounded-full bg-indigo-500 flex items-center justify-center text-white text-2xl font-bold shadow-lg">
-                                {selectedUser.email ? selectedUser.email[0].toUpperCase() : 'U'}
+                            <div className="p-3 bg-pink-500/10 rounded-xl border border-pink-500/20 text-pink-400">
+                                <Users size={24} />
                             </div>
                             <div>
-                                <h2 className="text-xl font-bold text-white break-all">{selectedUser.email}</h2>
-                                <div className="text-xs text-slate-400 font-mono mt-1">{selectedUser.id}</div>
-                                <div className="flex flex-wrap gap-2 mt-2">
-                                    <div className="text-sm px-2 py-1 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded">
-                                        Balance: {Number(userBalance).toFixed(2)} Credits
-                                    </div>
-                                    <div className="text-sm px-2 py-1 bg-slate-800 text-slate-300 border border-slate-700 rounded">
-                                        Created: {new Date(selectedUser.created_at).toLocaleDateString()}
-                                    </div>
-                                    <div className="text-sm px-2 py-1 bg-slate-800 text-slate-300 border border-slate-700 rounded">
-                                        Last Login: {selectedUser.last_sign_in_at ? new Date(selectedUser.last_sign_in_at).toLocaleDateString() : 'Never'}
-                                    </div>
+                                <h2 className="text-xl font-bold text-white">{selectedUser.email}</h2>
+                                <div className="flex items-center gap-2 text-xs text-slate-400 mt-1 font-mono">
+                                    <span>ID: {selectedUser.id}</span>
+                                    <span>•</span>
+                                    <span>Joined: {new Date(selectedUser.created_at).toLocaleDateString()}</span>
                                 </div>
                             </div>
                         </div>
@@ -268,84 +431,65 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
                             <X size={24} />
                         </button>
                     </div>
-                    
-                    <div className="flex-1 overflow-y-auto p-6 bg-[#1e293b] space-y-8">
-                        
-                        <section>
-                            <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2"><DollarSign size={18} className="text-emerald-400"/> Financial Overview</h3>
-                            {selectedUserFinancials && (
-                                <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-                                    <div className="bg-slate-800 p-4 rounded-xl border border-slate-700">
-                                        <div className="text-xs text-slate-400 uppercase font-bold mb-1">Purchased</div>
-                                        <div className="text-lg font-mono text-white">{selectedUserFinancials.totalPurchased.toFixed(2)} CR</div>
-                                    </div>
-                                    <div className="bg-slate-800 p-4 rounded-xl border border-slate-700">
-                                        <div className="text-xs text-slate-400 uppercase font-bold mb-1">Total Spent</div>
-                                        <div className="text-lg font-mono text-white">{selectedUserFinancials.totalSpent.toFixed(2)} CR</div>
-                                    </div>
-                                    <div className="bg-slate-800 p-4 rounded-xl border border-slate-700">
-                                        <div className="text-xs text-slate-400 uppercase font-bold mb-1">AI Cost (USD)</div>
-                                        <div className="text-lg font-mono text-white">${selectedUserFinancials.totalCost.toFixed(4)}</div>
-                                    </div>
-                                    <div className="bg-slate-800 p-4 rounded-xl border border-slate-700">
-                                        <div className="text-xs text-slate-400 uppercase font-bold mb-1">Profit (USD)</div>
-                                        <div className="text-lg font-mono text-emerald-400">${selectedUserFinancials.profitGenerated.toFixed(4)}</div>
+
+                    <div className="flex-1 overflow-y-auto p-6 space-y-6">
+                        {/* Financial Overview */}
+                        {selectedUserFinancials && (
+                            <div className="bg-slate-900/50 rounded-xl border border-slate-700 p-4 grid grid-cols-2 md:grid-cols-4 gap-4">
+                                <div>
+                                    <div className="text-xs text-slate-500 uppercase font-bold mb-1">Total Purchased</div>
+                                    <div className="text-lg font-mono text-white">{selectedUserFinancials.totalPurchased.toFixed(2)} CR</div>
+                                </div>
+                                <div>
+                                    <div className="text-xs text-slate-500 uppercase font-bold mb-1">Total Spent</div>
+                                    <div className="text-lg font-mono text-slate-300">{selectedUserFinancials.totalSpent.toFixed(2)} CR</div>
+                                </div>
+                                <div>
+                                    <div className="text-xs text-slate-500 uppercase font-bold mb-1">Provider Cost</div>
+                                    <div className="text-lg font-mono text-slate-300">${selectedUserFinancials.totalCost.toFixed(4)}</div>
+                                </div>
+                                <div>
+                                    <div className="text-xs text-slate-500 uppercase font-bold mb-1">Profit</div>
+                                    <div className={`text-lg font-mono font-bold ${selectedUserFinancials.profitGenerated >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                        ${selectedUserFinancials.profitGenerated.toFixed(4)}
                                     </div>
                                 </div>
-                            )}
-                            
-                            <div className="bg-slate-800/50 p-4 rounded-lg border border-slate-700">
-                                <h4 className="text-sm font-bold text-white mb-3">Manual Credit Adjustment</h4>
-                                <div className="flex gap-2 mb-2">
-                                    <input 
-                                        type="number" 
-                                        value={adjustmentAmount}
-                                        onChange={e => setAdjustmentAmount(e.target.value)}
-                                        placeholder="+/- Amount"
-                                        className="w-32 bg-slate-900 border border-slate-600 rounded px-3 py-2 text-white"
-                                    />
-                                    <input 
-                                        type="text" 
-                                        value={adjustmentNote}
-                                        onChange={e => setAdjustmentNote(e.target.value)}
-                                        placeholder="Reason (required)"
-                                        className="flex-1 bg-slate-900 border border-slate-600 rounded px-3 py-2 text-white"
-                                    />
-                                    <button 
-                                        onClick={() => handleAdjustCredit(selectedUser.id, selectedUser.email)}
-                                        className="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded font-medium"
-                                    >
-                                        Execute
-                                    </button>
-                                </div>
                             </div>
-                        </section>
+                        )}
 
-                        <section>
-                            <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2"><Box size={18} className="text-indigo-400"/> Projects ({userProjects.length})</h3>
-                            <div className="grid gap-3 max-h-60 overflow-y-auto">
-                                {userProjects.length === 0 ? <div className="text-slate-500 italic">No projects found.</div> : (
-                                    userProjects.map(p => (
-                                        <div key={p.id} className="bg-slate-800 p-3 rounded-lg border border-slate-700 flex justify-between items-center">
-                                            <div>
-                                                <div className="font-medium text-white">{p.name}</div>
-                                                <div className="text-xs text-slate-400">Updated: {new Date(p.updatedAt).toLocaleDateString()}</div>
-                                            </div>
-                                            <div className="flex items-center gap-2">
-                                                <span className={`text-xs px-2 py-1 rounded ${p.status==='generating'?'bg-indigo-900 text-indigo-200':'bg-slate-700 text-slate-300'}`}>{p.status}</span>
-                                                <div className="text-xs font-mono text-slate-500">{p.id.substring(0,8)}...</div>
-                                            </div>
-                                        </div>
-                                    ))
-                                )}
+                        {/* Adjust Balance Action */}
+                        <div className="bg-slate-800 border border-slate-700 rounded-xl p-4">
+                            <h3 className="text-sm font-bold text-white mb-3">Manual Balance Adjustment</h3>
+                            <div className="flex gap-2">
+                                <input 
+                                    type="number" 
+                                    value={adjustmentAmount}
+                                    onChange={e => setAdjustmentAmount(e.target.value)}
+                                    placeholder="+/- Amount"
+                                    className="w-32 bg-slate-900 border border-slate-600 rounded px-3 py-2 text-white text-sm"
+                                />
+                                <input 
+                                    type="text" 
+                                    value={adjustmentNote}
+                                    onChange={e => setAdjustmentNote(e.target.value)}
+                                    placeholder="Reason for adjustment"
+                                    className="flex-1 bg-slate-900 border border-slate-600 rounded px-3 py-2 text-white text-sm"
+                                />
+                                <button 
+                                    onClick={() => handleAdjustCredit(selectedUser.id, selectedUser.email)}
+                                    className="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded text-sm font-medium"
+                                >
+                                    Adjust
+                                </button>
                             </div>
-                        </section>
+                        </div>
 
-                        <section>
-                            <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2"><CreditCard size={18} className="text-slate-400"/> Recent Transactions</h3>
-                            <div className="overflow-x-auto rounded-lg border border-slate-700">
-                                <table className="w-full text-left text-sm text-slate-300">
-                                    <thead className="bg-slate-800 text-slate-400">
+                        {/* Recent Transactions */}
+                        <div className="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden">
+                            <div className="p-4 border-b border-slate-700 font-semibold text-white text-sm">Recent Transactions</div>
+                            <div className="overflow-x-auto max-h-64">
+                                <table className="w-full text-left text-xs">
+                                    <thead className="bg-slate-900 text-slate-400 sticky top-0">
                                         <tr>
                                             <th className="p-3">Date</th>
                                             <th className="p-3">Type</th>
@@ -353,23 +497,171 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
                                             <th className="p-3">Description</th>
                                         </tr>
                                     </thead>
-                                    <tbody className="divide-y divide-slate-700 bg-slate-900/50">
+                                    <tbody className="divide-y divide-slate-700">
                                         {selectedUserTransactions.length === 0 ? (
                                             <tr><td colSpan={4} className="p-4 text-center text-slate-500">No transactions found.</td></tr>
                                         ) : (
-                                            selectedUserTransactions.slice(0, 10).map((tx, i) => (
-                                                <tr key={i}>
-                                                    <td className="p-3 whitespace-nowrap">{new Date(tx.createdAt).toLocaleDateString()}</td>
-                                                    <td className="p-3"><span className="bg-slate-800 px-2 py-0.5 rounded text-xs">{tx.type}</span></td>
-                                                    <td className={`p-3 font-mono font-bold ${tx.amount > 0 ? 'text-emerald-400' : 'text-slate-400'}`}>{tx.amount}</td>
-                                                    <td className="p-3 text-xs text-slate-400 truncate max-w-[200px]">{tx.description}</td>
+                                            selectedUserTransactions.map((tx: any) => (
+                                                <tr key={tx.id} className="hover:bg-slate-700/30">
+                                                    <td className="p-3 text-slate-400">{new Date(tx.createdAt).toLocaleString()}</td>
+                                                    <td className="p-3">
+                                                        <span className={`px-2 py-0.5 rounded ${tx.type === 'purchase' ? 'bg-green-500/20 text-green-400' : 'bg-blue-500/20 text-blue-400'}`}>
+                                                            {tx.type}
+                                                        </span>
+                                                    </td>
+                                                    <td className="p-3 font-mono font-bold text-white">{tx.amount > 0 ? '+' : ''}{tx.amount}</td>
+                                                    <td className="p-3 text-slate-400 truncate max-w-[200px]">{tx.description || '-'}</td>
                                                 </tr>
                                             ))
                                         )}
                                     </tbody>
                                 </table>
                             </div>
-                        </section>
+                        </div>
+
+                    </div>
+                </div>
+            </div>
+        );
+    };
+
+    // --- Detail Modal ---
+    const UsageDetailsModal = () => {
+        const [revealKey, setRevealKey] = useState(false);
+        const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
+
+        if (!selectedUsageLog) return null;
+        
+        const meta = selectedUsageLog.meta || {};
+        const userObj = allUsers.find(u => u.id === selectedUsageLog.userId);
+        const projectObj = projects.find(p => p.id === selectedUsageLog.projectId);
+
+        const copyToClipboard = (text: string, field: string) => {
+            navigator.clipboard.writeText(text);
+            setCopyFeedback(field);
+            setTimeout(() => setCopyFeedback(null), 2000);
+        };
+
+        return (
+            <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[70] flex items-center justify-center p-4 animate-in fade-in zoom-in-95">
+                <div className="bg-[#1e293b] border border-slate-700 rounded-2xl w-full max-w-4xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
+                    {/* Header */}
+                    <div className="p-6 border-b border-slate-700 flex justify-between items-start bg-[#0f172a]">
+                        <div className="flex items-center gap-4">
+                            <div className="p-3 bg-indigo-500/10 rounded-xl border border-indigo-500/20 text-indigo-400">
+                                <Terminal size={24} />
+                            </div>
+                            <div>
+                                <h2 className="text-xl font-bold text-white">Usage Log Detail</h2>
+                                <div className="flex items-center gap-2 text-xs text-slate-400 mt-1 font-mono">
+                                    <span>ID: {selectedUsageLog.id}</span>
+                                    <span>•</span>
+                                    <span>{new Date(selectedUsageLog.createdAt).toLocaleString()}</span>
+                                </div>
+                            </div>
+                        </div>
+                        <button onClick={() => setSelectedUsageLog(null)} className="p-2 hover:bg-slate-800 rounded-full text-slate-400 transition-colors">
+                            <X size={24} />
+                        </button>
+                    </div>
+
+                    <div className="flex-1 overflow-y-auto p-6 space-y-6">
+                        
+                        {/* 1. Context Grid */}
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                            <div className="bg-slate-800 p-3 rounded-lg border border-slate-700">
+                                <div className="text-xs text-slate-500 uppercase font-bold mb-1 flex items-center gap-1"><Users size={12}/> User</div>
+                                <div className="text-sm text-white truncate" title={selectedUsageLog.userId}>{userObj?.email || selectedUsageLog.userId}</div>
+                            </div>
+                            <div className="bg-slate-800 p-3 rounded-lg border border-slate-700">
+                                <div className="text-xs text-slate-500 uppercase font-bold mb-1 flex items-center gap-1"><Box size={12}/> Project</div>
+                                <div className="text-sm text-white truncate" title={selectedUsageLog.projectId}>{projectObj?.name || selectedUsageLog.projectId || 'N/A'}</div>
+                            </div>
+                            <div className="bg-slate-800 p-3 rounded-lg border border-slate-700">
+                                <div className="text-xs text-slate-500 uppercase font-bold mb-1 flex items-center gap-1"><Brain size={12}/> Model</div>
+                                <div className="text-sm text-white truncate">{selectedUsageLog.model}</div>
+                            </div>
+                            <div className="bg-slate-800 p-3 rounded-lg border border-slate-700">
+                                <div className="text-xs text-slate-500 uppercase font-bold mb-1 flex items-center gap-1"><Activity size={12}/> Operation</div>
+                                <div className="text-sm text-white truncate">{selectedUsageLog.operationType}</div>
+                            </div>
+                        </div>
+
+                        {/* 2. Financials */}
+                        <div className="bg-slate-900/50 rounded-xl border border-slate-700 p-4 flex flex-col md:flex-row justify-between gap-4">
+                            <div>
+                                <div className="text-xs text-slate-500 uppercase font-bold mb-1">Token Usage</div>
+                                <div className="text-lg font-mono text-white">
+                                    <span className="text-sky-400">{selectedUsageLog.inputTokens}</span> <span className="text-slate-600">IN</span> / <span className="text-emerald-400">{selectedUsageLog.outputTokens}</span> <span className="text-slate-600">OUT</span>
+                                </div>
+                            </div>
+                            <div>
+                                <div className="text-xs text-slate-500 uppercase font-bold mb-1">Provider Cost</div>
+                                <div className="text-lg font-mono text-white">${selectedUsageLog.rawCostUsd.toFixed(6)}</div>
+                            </div>
+                            <div>
+                                <div className="text-xs text-slate-500 uppercase font-bold mb-1">User Charged</div>
+                                <div className="text-lg font-mono text-emerald-400">{selectedUsageLog.creditsDeducted.toFixed(4)} CR</div>
+                            </div>
+                        </div>
+
+                        {/* 3. API Trace Data */}
+                        <div className="space-y-4">
+                            <h3 className="text-sm font-bold text-slate-400 uppercase tracking-wider flex items-center gap-2">
+                                <Settings size={14} /> API Trace Data
+                            </h3>
+                            
+                            {/* API Key */}
+                            <div className="bg-slate-800 border border-slate-700 rounded-lg p-3">
+                                <div className="flex justify-between items-center mb-2">
+                                    <div className="text-xs font-bold text-slate-500 flex items-center gap-1"><Key size={12}/> API Key Used</div>
+                                    <button onClick={() => setRevealKey(!revealKey)} className="text-xs text-indigo-400 hover:text-white flex items-center gap-1">
+                                        {revealKey ? <EyeOff size={12}/> : <Eye size={12}/>} {revealKey ? 'Hide' : 'Reveal'}
+                                    </button>
+                                </div>
+                                <div className="font-mono text-sm text-slate-300 break-all">
+                                    {meta.apiKey ? (revealKey ? meta.apiKey : `${meta.apiKey.substring(0, 3)}...${meta.apiKey.substring(meta.apiKey.length - 4)}`) : <span className="text-slate-600 italic">Not captured in log</span>}
+                                </div>
+                            </div>
+
+                            {/* Prompt */}
+                            <div className="bg-slate-800 border border-slate-700 rounded-lg p-0 overflow-hidden">
+                                <div className="flex justify-between items-center px-3 py-2 bg-slate-900 border-b border-slate-700">
+                                    <div className="text-xs font-bold text-slate-500 flex items-center gap-1"><MessageSquare size={12}/> Prompt</div>
+                                    {meta.prompt && (
+                                        <button onClick={() => copyToClipboard(meta.prompt, 'prompt')} className="text-xs text-slate-400 hover:text-white flex items-center gap-1">
+                                            {copyFeedback === 'prompt' ? <Check size={12} className="text-green-500"/> : <Copy size={12}/>} Copy
+                                        </button>
+                                    )}
+                                </div>
+                                <div className="p-3 max-h-40 overflow-y-auto custom-scrollbar">
+                                    {meta.prompt ? (
+                                        <pre className="text-xs font-mono text-slate-300 whitespace-pre-wrap">{typeof meta.prompt === 'object' ? JSON.stringify(meta.prompt, null, 2) : meta.prompt}</pre>
+                                    ) : (
+                                        <span className="text-slate-600 text-xs italic">No prompt data recorded.</span>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Response / Raw Log */}
+                            <div className="bg-slate-800 border border-slate-700 rounded-lg p-0 overflow-hidden">
+                                <div className="flex justify-between items-center px-3 py-2 bg-slate-900 border-b border-slate-700">
+                                    <div className="text-xs font-bold text-slate-500 flex items-center gap-1"><FileJson size={12}/> Full Log / Response</div>
+                                    {meta.response && (
+                                        <button onClick={() => copyToClipboard(JSON.stringify(meta.response, null, 2), 'response')} className="text-xs text-slate-400 hover:text-white flex items-center gap-1">
+                                            {copyFeedback === 'response' ? <Check size={12} className="text-green-500"/> : <Copy size={12}/>} Copy
+                                        </button>
+                                    )}
+                                </div>
+                                <div className="p-3 max-h-60 overflow-y-auto custom-scrollbar">
+                                    {meta.response || meta.log ? (
+                                        <pre className="text-xs font-mono text-green-400/80 whitespace-pre-wrap">{typeof (meta.response || meta.log) === 'object' ? JSON.stringify(meta.response || meta.log, null, 2) : (meta.response || meta.log)}</pre>
+                                    ) : (
+                                        <span className="text-slate-600 text-xs italic">No detailed response log available.</span>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
 
                     </div>
                 </div>
@@ -380,11 +672,12 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
     return (
         <div className="flex h-screen bg-[#0f172a] text-slate-300 font-sans overflow-hidden">
             <UserDetailsModal />
+            <UsageDetailsModal />
             {showSqlWizard && (
                 <SqlSetupModal 
                     isOpen={true} 
                     errorType={dataError || "MANUAL_TRIGGER"} 
-                    onRetry={loadData} 
+                    onRetry={loadViewData} 
                     onClose={() => setShowSqlWizard(false)} 
                 />
             )}
@@ -414,10 +707,10 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
                 <nav className="flex-1 p-2 space-y-1 overflow-y-auto">
                     {[
                         { id: 'dashboard', label: 'Dashboard', icon: Activity },
+                        { id: 'ai', label: 'AI Provider', icon: Brain }, // Moved up
                         { id: 'financials', label: 'Financials', icon: DollarSign },
                         { id: 'users', label: 'Users', icon: Users },
                         { id: 'projects', label: 'Projects', icon: Box },
-                        { id: 'ai', label: 'AI Engine', icon: Brain },
                         { id: 'webhooks', label: 'Webhooks', icon: Radio },
                         { id: 'errors', label: 'Error Center', icon: AlertTriangle },
                         { id: 'settings', label: 'System Settings', icon: Settings },
@@ -448,13 +741,13 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
                         <h2 className="text-xl font-semibold text-white capitalize">{view}</h2>
                     </div>
                     <div className="flex items-center gap-4">
-                        <button onClick={view === 'webhooks' ? loadWebhookData : loadData} className="p-2 hover:bg-slate-800 rounded-full text-slate-400 hover:text-white" title="Refresh Data">
+                        <button onClick={() => loadViewData()} className="p-2 hover:bg-slate-800 rounded-full text-slate-400 hover:text-white" title="Refresh Data">
                             <RefreshCw size={16} />
                         </button>
                     </div>
                 </header>
 
-                <main className="flex-1 overflow-y-auto p-4 md:p-6">
+                <main className="flex-1 overflow-y-auto p-4 md:p-6 relative">
                     {/* Error Banner */}
                     {dataError && (
                         <div className="mb-6 bg-red-900/20 border border-red-500/30 p-4 rounded-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
@@ -466,6 +759,12 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
                                 </div>
                             </div>
                             <button onClick={() => setShowSqlWizard(true)} className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg text-sm font-medium whitespace-nowrap">Run Fix Script</button>
+                        </div>
+                    )}
+
+                    {isLoading && (
+                        <div className="absolute inset-0 z-10 bg-[#0f172a]/50 backdrop-blur-sm flex items-center justify-center">
+                            <Loader2 className="animate-spin text-indigo-500" size={32} />
                         </div>
                     )}
 
@@ -491,7 +790,144 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
                         </div>
                     )}
 
-                    {/* WEBHOOKS VIEW */}
+                    {/* SETTINGS VIEW */}
+                    {view === 'settings' && (
+                        <div className="bg-slate-800 rounded-xl border border-slate-700 p-6 space-y-6 relative pb-20">
+                            <div className="flex justify-between items-center mb-4">
+                                <div className="flex items-center gap-3">
+                                    <h3 className="text-lg font-bold text-white">System Prompts</h3>
+                                    <button 
+                                        onClick={handleResetAllPrompts}
+                                        className="text-xs text-red-400 hover:text-red-300 flex items-center gap-1 bg-red-900/20 border border-red-900/50 px-3 py-1.5 rounded-full transition-colors"
+                                    >
+                                        <Trash2 size={12} /> Reset All to Defaults
+                                    </button>
+                                </div>
+                                <button 
+                                    onClick={handleSaveAllPrompts}
+                                    disabled={isSavingPrompts}
+                                    className="fixed bottom-8 right-8 z-50 bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 px-6 rounded-full shadow-2xl flex items-center gap-2 transition-all hover:scale-105 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                    {isSavingPrompts ? <Loader2 className="animate-spin" size={20} /> : <Save size={20} />}
+                                    Save All Changes
+                                </button>
+                            </div>
+                            <div className="grid gap-8">
+                                {Object.entries(PROMPT_KEYS).map(([key, storageKey]) => (
+                                    <div key={key} className="space-y-2 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50">
+                                        <div className="flex justify-between items-center">
+                                            <label className="text-sm font-bold text-indigo-400 font-mono uppercase tracking-wider">{key.replace('sys_prompt_', '')}</label>
+                                            <button onClick={() => handleResetPrompt(key)} className="text-xs text-slate-500 hover:text-white transition-colors">Reset to Default</button>
+                                        </div>
+                                        <textarea
+                                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs font-mono text-slate-300 h-48 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/50 transition-all resize-y"
+                                            value={prompts[key] || ''}
+                                            onChange={(e) => setPrompts(prev => ({...prev, [key]: e.target.value}))}
+                                            spellCheck={false}
+                                        />
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* ... other views (users, projects, database, etc.) same as before ... */}
+                    {view === 'users' && (
+                        <div className="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden flex flex-col">
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-left text-sm min-w-[800px]">
+                                    <thead className="bg-slate-900 text-slate-400">
+                                        <tr>
+                                            <th className="p-4">User</th>
+                                            <th className="p-4">Credits</th>
+                                            <th className="p-4">Projects</th>
+                                            <th className="p-4">Created</th>
+                                            <th className="p-4">Last Seen</th>
+                                            <th className="p-4"></th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-slate-700">
+                                        {allUsers.map(u => (
+                                            <tr key={u.id} className="hover:bg-slate-700/50 cursor-pointer" onClick={() => handleUserSelect(u)}>
+                                                <td className="p-4">
+                                                    <div className="font-bold text-white">{u.email}</div>
+                                                    <div className="text-xs text-slate-500 font-mono">{u.id}</div>
+                                                </td>
+                                                <td className="p-4 font-mono text-emerald-400">{Number(u.credits_balance || 0).toFixed(2)}</td>
+                                                <td className="p-4">{u.project_count}</td>
+                                                <td className="p-4 text-slate-400">{new Date(u.created_at).toLocaleDateString()}</td>
+                                                <td className="p-4 text-slate-400">{u.last_sign_in_at ? new Date(u.last_sign_in_at).toLocaleDateString() : 'Never'}</td>
+                                                <td className="p-4"><ChevronRight size={16} className="text-slate-500"/></td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                            <PaginationControls currentPage={currentPage} totalItems={totalItems} itemsPerPage={ITEMS_PER_PAGE} onPageChange={setCurrentPage} />
+                        </div>
+                    )}
+
+                    {view === 'projects' && (
+                        <div className="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden flex flex-col">
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-left text-sm">
+                                    <thead className="bg-slate-900 text-slate-400">
+                                        <tr>
+                                            <th className="p-4">Project Name</th>
+                                            <th className="p-4">Owner</th>
+                                            <th className="p-4">Status</th>
+                                            <th className="p-4">Created</th>
+                                            <th className="p-4">Updated</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-slate-700">
+                                        {projects.map(p => (
+                                            <tr key={p.id} className="hover:bg-slate-700/50">
+                                                <td className="p-4 font-medium text-white">
+                                                    <Link to={`/project/${p.id}`} className="text-indigo-400 hover:text-indigo-300 hover:underline transition-colors">
+                                                        {p.name}
+                                                    </Link>
+                                                </td>
+                                                <td className="p-4 text-slate-400 font-mono text-xs">{p.userId}</td>
+                                                <td className="p-4">
+                                                    <span className={`px-2 py-1 rounded text-xs ${p.status === 'generating' ? 'bg-indigo-900 text-indigo-200' : 'bg-slate-700 text-slate-300'}`}>
+                                                        {p.status}
+                                                    </span>
+                                                </td>
+                                                <td className="p-4 text-slate-400">{new Date(p.createdAt).toLocaleDateString()}</td>
+                                                <td className="p-4 text-slate-400">{new Date(p.updatedAt).toLocaleDateString()}</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                            <PaginationControls currentPage={currentPage} totalItems={totalItems} itemsPerPage={ITEMS_PER_PAGE} onPageChange={setCurrentPage} />
+                        </div>
+                    )}
+
+                    {view === 'errors' && (
+                        <div className="space-y-4">
+                            {logs.length === 0 ? (
+                                <div className="text-center p-8 text-slate-500 bg-slate-800 rounded-xl border border-slate-700">No critical errors found in this page.</div>
+                            ) : (
+                                logs.map(log => (
+                                    <div key={log.id} className="bg-red-900/10 border border-red-900/30 p-4 rounded-xl">
+                                        <div className="flex justify-between items-start mb-2">
+                                            <div className="flex items-center gap-2">
+                                                <AlertTriangle size={16} className="text-red-500" />
+                                                <span className="font-bold text-red-400 uppercase text-xs">{log.level}</span>
+                                                <span className="text-slate-500 text-xs">{new Date(log.timestamp).toLocaleString()}</span>
+                                            </div>
+                                            <span className="text-xs bg-slate-800 text-slate-400 px-2 py-1 rounded">{log.source}</span>
+                                        </div>
+                                        <p className="text-white text-sm font-mono">{log.message}</p>
+                                    </div>
+                                ))
+                            )}
+                            <PaginationControls currentPage={currentPage} totalItems={totalItems} itemsPerPage={ITEMS_PER_PAGE} onPageChange={setCurrentPage} />
+                        </div>
+                    )}
+
                     {view === 'webhooks' && (
                         <div className="space-y-6 max-w-5xl mx-auto">
                             {/* Configuration */}
@@ -548,10 +984,10 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
                             </div>
 
                             {/* Recent Logs */}
-                            <div className="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden">
+                            <div className="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden flex flex-col">
                                 <div className="p-4 border-b border-slate-700 flex justify-between items-center">
                                     <span className="font-semibold text-white">Recent Delivery Logs</span>
-                                    <button onClick={loadWebhookData} className="text-xs text-slate-400 hover:text-white flex items-center gap-1"><RefreshCw size={12}/> Refresh</button>
+                                    <button onClick={loadViewData} className="text-xs text-slate-400 hover:text-white flex items-center gap-1"><RefreshCw size={12}/> Refresh</button>
                                 </div>
                                 <div className="overflow-x-auto">
                                     <table className="w-full text-left text-sm">
@@ -585,6 +1021,203 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
                                         </tbody>
                                     </table>
                                 </div>
+                                <PaginationControls currentPage={currentPage} totalItems={totalItems} itemsPerPage={ITEMS_PER_PAGE} onPageChange={setCurrentPage} />
+                            </div>
+                        </div>
+                    )}
+
+                    {view === 'ai' && (
+                        <div className="space-y-6">
+                            {aiConfigs.length === 0 && (
+                                <div className="p-6 bg-yellow-500/10 border border-yellow-500/20 rounded-xl flex items-center gap-4">
+                                    <AlertTriangle className="text-yellow-500" size={24} />
+                                    <div>
+                                        <h3 className="text-yellow-200 font-bold">No AI Providers Found</h3>
+                                        <p className="text-yellow-100/70 text-sm">The configuration table seems empty. Run the setup wizard to seed default providers.</p>
+                                    </div>
+                                    <button onClick={() => setShowSqlWizard(true)} className="px-4 py-2 bg-yellow-600 hover:bg-yellow-500 text-white rounded-lg text-sm font-bold">Run Setup</button>
+                                </div>
+                            )}
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                                {aiConfigs.map(config => (
+                                    <div key={config.id} className={`p-6 rounded-xl border-2 transition-all ${config.isActive ? 'bg-indigo-900/10 border-indigo-500' : 'bg-slate-800 border-slate-700'}`}>
+                                        <div className="flex justify-between items-start mb-4">
+                                            <div className="flex items-center gap-3">
+                                                <div className={`p-2 rounded-lg ${config.id === 'google' ? 'bg-blue-500/20 text-blue-400' : config.id === 'openai' ? 'bg-green-500/20 text-green-400' : 'bg-orange-500/20 text-orange-400'}`}>
+                                                    <Brain size={24} />
+                                                </div>
+                                                <div>
+                                                    <h3 className="font-bold text-white text-lg">{config.name}</h3>
+                                                    <span className={`text-xs px-2 py-0.5 rounded-full ${config.apiKey ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400'}`}>
+                                                        {config.apiKey ? 'Connected' : 'Not Configured'}
+                                                    </span>
+                                                </div>
+                                            </div>
+                                            {config.isActive && <span className="bg-indigo-600 text-white text-xs px-2 py-1 rounded font-bold">ACTIVE</span>}
+                                        </div>
+
+                                        <div className="space-y-4">
+                                            <div>
+                                                <label className="text-xs text-slate-400 mb-1 block">Model</label>
+                                                <select 
+                                                    value={config.model}
+                                                    onChange={(e) => handleUpdateModel(config.id, e.target.value)}
+                                                    className="w-full bg-slate-900 border border-slate-600 rounded px-3 py-2 text-sm text-white focus:border-indigo-500 outline-none"
+                                                >
+                                                    {aiProviderService.getAvailableModels(config.id).map(m => (
+                                                        <option key={m} value={m}>{m}</option>
+                                                    ))}
+                                                </select>
+                                            </div>
+
+                                            <div>
+                                                <label className="text-xs text-slate-400 mb-1 block">API Key</label>
+                                                {editingProviderId === config.id ? (
+                                                    <div className="flex gap-2">
+                                                        <input 
+                                                            type="password" 
+                                                            value={tempApiKey}
+                                                            onChange={(e) => setTempApiKey(e.target.value)}
+                                                            placeholder="sk-..."
+                                                            className="flex-1 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm text-white"
+                                                        />
+                                                        <button onClick={() => handleSaveApiKey(config.id)} className="bg-green-600 hover:bg-green-500 p-1 rounded text-white"><Check size={16}/></button>
+                                                        <button onClick={() => setEditingProviderId(null)} className="bg-slate-600 hover:bg-slate-500 p-1 rounded text-white"><X size={16}/></button>
+                                                    </div>
+                                                ) : (
+                                                    <div className="flex justify-between items-center bg-slate-900 p-2 rounded border border-slate-700">
+                                                        <span className="text-slate-500 text-xs">{config.apiKey ? '••••••••••••••••' : 'No Key Set'}</span>
+                                                        <button onClick={() => { setEditingProviderId(config.id); setTempApiKey(''); }} className="text-slate-400 hover:text-white"><Settings size={14}/></button>
+                                                    </div>
+                                                )}
+                                            </div>
+
+                                            <div className="flex justify-between items-center pt-2 border-t border-slate-700/50">
+                                                <div className="flex items-center gap-2">
+                                                    <button onClick={() => handleToggleActiveAI(config)} disabled={config.isActive} className={`text-xs flex items-center gap-1 ${config.isActive ? 'text-indigo-400 cursor-default' : 'text-slate-400 hover:text-white'}`}>
+                                                        {config.isActive ? <ToggleRight size={18} /> : <ToggleLeft size={18} />} Active Provider
+                                                    </button>
+                                                </div>
+                                                <div className="flex items-center gap-2">
+                                                    <button onClick={() => handleToggleFallbackAI(config)} className={`text-xs flex items-center gap-1 ${config.isFallback ? 'text-yellow-400' : 'text-slate-400 hover:text-white'}`}>
+                                                        {config.isFallback ? <ToggleRight size={18} /> : <ToggleLeft size={18} />} Fallback
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+
+                            {/* AI Usage Summary */}
+                            <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 space-y-6">
+                                <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                                    <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                                        <BarChart3 size={20} className="text-indigo-400" />
+                                        AI Usage Summary
+                                    </h3>
+                                    <div className="flex items-center gap-2">
+                                        <Filter size={16} className="text-slate-400" />
+                                        <select 
+                                            value={aiFilter} 
+                                            onChange={(e) => setAiFilter(e.target.value)}
+                                            className="bg-slate-900 border border-slate-600 text-white text-sm rounded-lg focus:ring-indigo-500 focus:border-indigo-500 block px-3 py-2 outline-none"
+                                        >
+                                            <option value="all">All Providers</option>
+                                            <option value="google">Google Gemini</option>
+                                            <option value="openai">OpenAI</option>
+                                            <option value="claude">Anthropic Claude</option>
+                                        </select>
+                                    </div>
+                                </div>
+
+                                <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+                                    <div className="p-4 bg-slate-900/50 rounded-lg border border-slate-700">
+                                        <div className="text-slate-400 text-xs uppercase font-bold mb-1">Requests</div>
+                                        <div className="text-2xl font-bold text-white">{aiStats.count}</div>
+                                        <div className="text-[10px] text-slate-500">Filtered Count</div>
+                                    </div>
+                                    <div className="p-4 bg-slate-900/50 rounded-lg border border-slate-700">
+                                        <div className="text-slate-400 text-xs uppercase font-bold mb-1">Total Tokens</div>
+                                        <div className="text-lg font-bold text-slate-200 break-all">
+                                            <span className="text-sky-400">{aiStats.inputTokens.toLocaleString()}</span> / <span className="text-emerald-400">{aiStats.outputTokens.toLocaleString()}</span>
+                                        </div>
+                                        <div className="text-[10px] text-slate-500">Input / Output</div>
+                                    </div>
+                                    <div className="p-4 bg-slate-900/50 rounded-lg border border-slate-700">
+                                        <div className="text-slate-400 text-xs uppercase font-bold mb-1">Provider Cost</div>
+                                        <div className="text-2xl font-bold text-white">${aiStats.cost.toFixed(4)}</div>
+                                        <div className="text-[10px] text-slate-500">API Cost (USD)</div>
+                                    </div>
+                                    <div className="p-4 bg-slate-900/50 rounded-lg border border-slate-700">
+                                        <div className="text-slate-400 text-xs uppercase font-bold mb-1">Revenue (Est.)</div>
+                                        <div className="text-2xl font-bold text-emerald-400">${revenueUsd.toFixed(4)}</div>
+                                        <div className="text-[10px] text-slate-500">{aiStats.credits.toFixed(2)} Credits Deducted</div>
+                                    </div>
+                                    <div className="p-4 bg-slate-900/50 rounded-lg border border-slate-700">
+                                        <div className="text-slate-400 text-xs uppercase font-bold mb-1">Net Profit</div>
+                                        <div className={`text-2xl font-bold ${profitUsd >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                            ${profitUsd.toFixed(4)}
+                                        </div>
+                                        <div className="text-[10px] text-slate-500">Revenue - Cost</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Detailed Usage Log (Ledger) for AI Tab */}
+                            <div className="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden flex flex-col">
+                                <div className="p-4 border-b border-slate-700 flex justify-between items-center">
+                                    <span className="font-semibold text-white">Detailed Usage Log ({aiFilter === 'all' ? 'All' : aiFilter})</span>
+                                    <span className="text-xs text-slate-500">Page {currentPage}</span>
+                                </div>
+                                <div className="overflow-x-auto">
+                                    <table className="w-full text-left text-sm">
+                                        <thead className="bg-slate-900 text-slate-400">
+                                            <tr>
+                                                <th className="p-3">Time</th>
+                                                <th className="p-3">User</th>
+                                                <th className="p-3">Project</th>
+                                                <th className="p-3">Model</th>
+                                                <th className="p-3">Action</th>
+                                                <th className="p-3">Input Tokens</th>
+                                                <th className="p-3">Output Tokens</th>
+                                                <th className="p-3">Cost</th>
+                                                <th className="p-3">Credits</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-slate-700">
+                                            {filteredLedger.length === 0 ? (
+                                                <tr><td colSpan={9} className="p-8 text-center text-slate-500">No usage data found for this filter.</td></tr>
+                                            ) : (
+                                                filteredLedger.map((row: any, i: number) => {
+                                                    const userObj = allUsers.find(u => u.id === row.userId);
+                                                    const projectObj = projects.find(p => p.id === row.projectId);
+                                                    
+                                                    return (
+                                                        <tr key={i} className="hover:bg-slate-700/30 cursor-pointer" onClick={() => setSelectedUsageLog(row)}>
+                                                            <td className="p-3 text-slate-400 whitespace-nowrap text-xs">{new Date(row.createdAt).toLocaleString()}</td>
+                                                            
+                                                            <td className="p-3 text-xs max-w-[150px] truncate text-slate-300" title={userObj?.email || row.userId}>
+                                                                {userObj?.email || <span className="font-mono opacity-50">{row.userId.substring(0, 8)}...</span>}
+                                                            </td>
+                                                            <td className="p-3 text-xs max-w-[150px] truncate text-slate-300" title={projectObj?.name || row.projectId}>
+                                                                {projectObj?.name || (row.projectId ? <span className="font-mono opacity-50">{row.projectId.substring(0, 8)}...</span> : '-')}
+                                                            </td>
+
+                                                            <td className="p-3 text-white text-xs">{row.model}</td>
+                                                            <td className="p-3 text-slate-400 text-xs">{row.operationType}</td>
+                                                            <td className="p-3 font-mono text-slate-400">{row.inputTokens}</td>
+                                                            <td className="p-3 font-mono text-slate-400">{row.outputTokens}</td>
+                                                            <td className="p-3 font-mono text-emerald-400">${Number(row.rawCostUsd).toFixed(5)}</td>
+                                                            <td className="p-3 font-mono text-slate-300">{Number(row.creditsDeducted).toFixed(4)}</td>
+                                                        </tr>
+                                                    );
+                                                })
+                                            )}
+                                        </tbody>
+                                    </table>
+                                </div>
+                                <PaginationControls currentPage={currentPage} totalItems={totalItems} itemsPerPage={ITEMS_PER_PAGE} onPageChange={setCurrentPage} />
                             </div>
                         </div>
                     )}
@@ -635,7 +1268,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
 
                             {/* Manual Ops Consolidated */}
                             <div className="bg-slate-800 border border-slate-700 rounded-xl p-6">
-                                <h3 className="text-lg font-bold text-white flex items-center gap-2 mb-4"><CreditCard size={20} className="text-emerald-400"/> Manual Adjustment</h3>
+                                <h3 className="text-lg font-bold text-white flex items-center gap-2"><CreditCard size={20} className="text-emerald-400"/> Manual Adjustment</h3>
                                 <div className="space-y-4">
                                     <div className="flex gap-2">
                                         <input 
@@ -649,7 +1282,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
                                             onClick={() => {
                                                 const found = allUsers.find(u => u.email.includes(userSearch));
                                                 setTargetUser(found || null);
-                                                if(!found) alert("User not found");
+                                                if(!found) alert("User not found (or load Users tab first)");
                                             }}
                                             className="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg"
                                         >
@@ -688,7 +1321,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
                             </div>
 
                             {/* Ledger */}
-                            <div className="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden">
+                            <div className="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden flex flex-col">
                                 <div className="p-4 border-b border-slate-700 font-semibold text-white">Global Ledger</div>
                                 <div className="overflow-x-auto">
                                     <table className="w-full text-left text-sm">
@@ -720,199 +1353,7 @@ const AdminPanel: React.FC<AdminPanelProps> = ({ user, onClose }) => {
                                         </tbody>
                                     </table>
                                 </div>
-                            </div>
-                        </div>
-                    )}
-
-                    {/* USERS VIEW */}
-                    {view === 'users' && (
-                        <div className="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden">
-                            <div className="overflow-x-auto">
-                                <table className="w-full text-left text-sm min-w-[800px]">
-                                    <thead className="bg-slate-900 text-slate-400">
-                                        <tr>
-                                            <th className="p-4">User</th>
-                                            <th className="p-4">Credits</th>
-                                            <th className="p-4">Projects</th>
-                                            <th className="p-4">Created</th>
-                                            <th className="p-4">Last Seen</th>
-                                            <th className="p-4"></th>
-                                        </tr>
-                                    </thead>
-                                    <tbody className="divide-y divide-slate-700">
-                                        {allUsers.map(u => (
-                                            <tr key={u.id} className="hover:bg-slate-700/50 cursor-pointer" onClick={() => handleUserSelect(u)}>
-                                                <td className="p-4">
-                                                    <div className="font-bold text-white">{u.email}</div>
-                                                    <div className="text-xs text-slate-500 font-mono">{u.id}</div>
-                                                </td>
-                                                <td className="p-4 font-mono text-emerald-400">{Number(u.credits_balance || 0).toFixed(2)}</td>
-                                                <td className="p-4">{u.project_count}</td>
-                                                <td className="p-4 text-slate-400">{new Date(u.created_at).toLocaleDateString()}</td>
-                                                <td className="p-4 text-slate-400">{u.last_sign_in_at ? new Date(u.last_sign_in_at).toLocaleDateString() : 'Never'}</td>
-                                                <td className="p-4"><ChevronRight size={16} className="text-slate-500"/></td>
-                                            </tr>
-                                        ))}
-                                    </tbody>
-                                </table>
-                            </div>
-                        </div>
-                    )}
-
-                    {/* PROJECTS VIEW */}
-                    {view === 'projects' && (
-                        <div className="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden">
-                            <div className="overflow-x-auto">
-                                <table className="w-full text-left text-sm">
-                                    <thead className="bg-slate-900 text-slate-400">
-                                        <tr>
-                                            <th className="p-4">Project Name</th>
-                                            <th className="p-4">Owner</th>
-                                            <th className="p-4">Status</th>
-                                            <th className="p-4">Created</th>
-                                            <th className="p-4">Updated</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody className="divide-y divide-slate-700">
-                                        {projects.map(p => (
-                                            <tr key={p.id} className="hover:bg-slate-700/50">
-                                                <td className="p-4 font-medium text-white">
-                                                    <Link to={`/project/${p.id}`} className="text-indigo-400 hover:text-indigo-300 hover:underline transition-colors">
-                                                        {p.name}
-                                                    </Link>
-                                                </td>
-                                                <td className="p-4 text-slate-400 font-mono text-xs">{p.userId}</td>
-                                                <td className="p-4">
-                                                    <span className={`px-2 py-1 rounded text-xs ${p.status === 'generating' ? 'bg-indigo-900 text-indigo-200' : 'bg-slate-700 text-slate-300'}`}>
-                                                        {p.status}
-                                                    </span>
-                                                </td>
-                                                <td className="p-4 text-slate-400">{new Date(p.createdAt).toLocaleDateString()}</td>
-                                                <td className="p-4 text-slate-400">{new Date(p.updatedAt).toLocaleDateString()}</td>
-                                            </tr>
-                                        ))}
-                                    </tbody>
-                                </table>
-                            </div>
-                        </div>
-                    )}
-
-                    {/* AI ENGINE VIEW */}
-                    {view === 'ai' && (
-                        <div className="space-y-6">
-                            {/* Summary Cards */}
-                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-                                <div className="bg-slate-800 p-6 rounded-xl border border-slate-700">
-                                    <div className="flex items-center gap-3 mb-2">
-                                        <DollarSign size={18} className="text-red-400" />
-                                        <div className="text-slate-400 text-sm font-medium">Total AI Cost</div>
-                                    </div>
-                                    <div className="text-2xl font-bold text-white">${financialStats.totalCostUsd.toFixed(4)}</div>
-                                </div>
-                                <div className="bg-slate-800 p-6 rounded-xl border border-slate-700">
-                                    <div className="flex items-center gap-3 mb-2">
-                                        <Scale size={18} className="text-emerald-400" />
-                                        <div className="text-slate-400 text-sm font-medium">Platform Profit</div>
-                                    </div>
-                                    <div className="text-2xl font-bold text-white">${financialStats.netProfitUsd.toFixed(4)}</div>
-                                </div>
-                                <div className="bg-slate-800 p-6 rounded-xl border border-slate-700">
-                                    <div className="flex items-center gap-3 mb-2">
-                                        <Zap size={18} className="text-indigo-400" />
-                                        <div className="text-slate-400 text-sm font-medium">Total Tokens</div>
-                                    </div>
-                                    <div className="text-2xl font-bold text-white">
-                                        {((financialStats.totalInputTokens || 0) + (financialStats.totalOutputTokens || 0)).toLocaleString()}
-                                    </div>
-                                    <div className="text-xs text-slate-500 mt-1">
-                                        I: {(financialStats.totalInputTokens || 0).toLocaleString()} / O: {(financialStats.totalOutputTokens || 0).toLocaleString()}
-                                    </div>
-                                </div>
-                                <div className="bg-slate-800 p-6 rounded-xl border border-slate-700">
-                                    <div className="flex items-center gap-3 mb-2">
-                                        <BarChart3 size={18} className="text-blue-400" />
-                                        <div className="text-slate-400 text-sm font-medium">Total Requests</div>
-                                    </div>
-                                    <div className="text-2xl font-bold text-white">{financialStats.totalRequestCount || 0}</div>
-                                </div>
-                            </div>
-
-                            <div className="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden">
-                                <div className="p-4 border-b border-slate-700 font-semibold text-white">Detailed Usage Log (Ledger)</div>
-                                <div className="overflow-x-auto">
-                                    <table className="w-full text-left text-sm">
-                                        <thead className="bg-slate-900 text-slate-400">
-                                            <tr>
-                                                <th className="p-3">Time</th>
-                                                <th className="p-3">Model</th>
-                                                <th className="p-3">Input Tokens</th>
-                                                <th className="p-3">Output Tokens</th>
-                                                <th className="p-3">Cost</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody className="divide-y divide-slate-700">
-                                            {ledger.length === 0 ? (
-                                                <tr><td colSpan={5} className="p-8 text-center text-slate-500">No usage data found.</td></tr>
-                                            ) : (
-                                                ledger.map((row: any, i: number) => (
-                                                    <tr key={i} className="hover:bg-slate-700/30">
-                                                        <td className="p-3 text-slate-400">{new Date(row.createdAt).toLocaleString()}</td>
-                                                        <td className="p-3 text-white">{row.model}</td>
-                                                        <td className="p-3 font-mono text-slate-400">{row.inputTokens}</td>
-                                                        <td className="p-3 font-mono text-slate-400">{row.outputTokens}</td>
-                                                        <td className="p-3 font-mono text-emerald-400">${Number(row.rawCostUsd).toFixed(5)}</td>
-                                                    </tr>
-                                                ))
-                                            )}
-                                        </tbody>
-                                    </table>
-                                </div>
-                            </div>
-                        </div>
-                    )}
-
-                    {/* ERROR CENTER VIEW */}
-                    {view === 'errors' && (
-                        <div className="space-y-4">
-                            {logs.filter(l => l.level === 'error' || l.level === 'critical').length === 0 ? (
-                                <div className="text-center p-8 text-slate-500 bg-slate-800 rounded-xl border border-slate-700">No critical errors found.</div>
-                            ) : (
-                                logs.filter(l => l.level === 'error' || l.level === 'critical').map(log => (
-                                    <div key={log.id} className="bg-red-900/10 border border-red-900/30 p-4 rounded-xl">
-                                        <div className="flex justify-between items-start mb-2">
-                                            <div className="flex items-center gap-2">
-                                                <AlertTriangle size={16} className="text-red-500" />
-                                                <span className="font-bold text-red-400 uppercase text-xs">{log.level}</span>
-                                                <span className="text-slate-500 text-xs">{new Date(log.timestamp).toLocaleString()}</span>
-                                            </div>
-                                            <span className="text-xs bg-slate-800 text-slate-400 px-2 py-1 rounded">{log.source}</span>
-                                        </div>
-                                        <p className="text-white text-sm font-mono">{log.message}</p>
-                                    </div>
-                                ))
-                            )}
-                        </div>
-                    )}
-
-                    {/* SETTINGS VIEW */}
-                    {view === 'settings' && (
-                        <div className="bg-slate-800 rounded-xl border border-slate-700 p-6 space-y-6">
-                            <h3 className="text-lg font-bold text-white mb-4">System Prompts</h3>
-                            <div className="grid gap-6">
-                                {Object.entries(PROMPT_KEYS).map(([key, storageKey]) => (
-                                    <div key={key} className="space-y-2">
-                                        <div className="flex justify-between">
-                                            <label className="text-sm font-medium text-slate-300">{key}</label>
-                                            <button onClick={() => handleResetPrompt(key)} className="text-xs text-slate-500 hover:text-white">Reset to Default</button>
-                                        </div>
-                                        <textarea
-                                            className="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-xs font-mono text-slate-300 h-32 focus:outline-none focus:border-indigo-500"
-                                            value={prompts[key] || ''}
-                                            onChange={(e) => setPrompts(prev => ({...prev, [key]: e.target.value}))}
-                                        />
-                                        <button onClick={() => handleSavePrompt(key, prompts[key] || '')} className="text-xs bg-indigo-600 text-white px-3 py-1 rounded">Save</button>
-                                    </div>
-                                ))}
+                                <PaginationControls currentPage={currentPage} totalItems={totalItems} itemsPerPage={ITEMS_PER_PAGE} onPageChange={setCurrentPage} />
                             </div>
                         </div>
                     )}

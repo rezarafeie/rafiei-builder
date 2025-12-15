@@ -1,7 +1,6 @@
 
 import { User } from '../types';
 import { createClient } from '@supabase/supabase-js';
-import { cloudService } from './cloudService';
 
 // Default Fallback
 const DEFAULT_WEBHOOK_URL = 'https://hook.us1.make.com/jx8gnwt3nvrhz4ozyu3cdw68ky2eoc8m';
@@ -78,11 +77,12 @@ class WebhookService {
         }
 
         try {
-            const dbUrl = await cloudService.getSystemSetting('webhook_url');
-            if (dbUrl) {
-                this.cachedUrl = dbUrl;
+            // Direct DB call to avoid circular dependency on cloudService
+            const { data } = await supabase.from('system_settings').select('value').eq('key', 'webhook_url').single();
+            if (data?.value) {
+                this.cachedUrl = data.value;
                 this.lastCacheTime = Date.now();
-                return dbUrl;
+                return data.value;
             }
         } catch(e) {
             console.warn("Failed to fetch webhook URL from DB, using default.", e);
@@ -95,7 +95,7 @@ class WebhookService {
      * Resolves the current actor. 
      * Uses provided user object if available, otherwise attempts to fetch session from Supabase.
      */
-    private async resolveActor(providedUser?: User | { id: string, email?: string }): Promise<Actor> {
+    private async resolveActor(providedUser?: { id: string, email?: string }): Promise<Actor> {
         if (providedUser && providedUser.email) {
             return {
                 user_id: providedUser.id,
@@ -126,7 +126,7 @@ class WebhookService {
         type: EventType, 
         data: Record<string, any> = {}, 
         context: Record<string, any> = {}, 
-        user?: User | { id: string, email?: string }
+        user?: { id: string, email?: string }
     ): Promise<void> {
         // Resolve actor first
         this.resolveActor(user).then(async actor => {
@@ -159,15 +159,17 @@ class WebhookService {
                 body: JSON.stringify(payload)
             });
 
-            // Log attempt
             const responseBody = await res.text();
             
-            await cloudService.saveWebhookLog({
-                event_type: payload.event.type,
-                payload: payload,
-                status_code: res.status,
-                response_body: responseBody.substring(0, 1000) // Truncate if huge
-            });
+            // Direct DB Log to avoid circular dependency
+            try {
+                await supabase.from('webhook_logs').insert({
+                    event_type: payload.event.type,
+                    payload: payload,
+                    status_code: res.status,
+                    response_body: responseBody.substring(0, 1000)
+                });
+            } catch(e) {}
 
             if (!res.ok) {
                 console.warn(`[Webhook] Delivery failed (${res.status}). Type: ${payload.event.type}. Attempt ${attempt}`);
@@ -178,13 +180,15 @@ class WebhookService {
         } catch (err: any) {
             console.warn(`[Webhook] Network error. Type: ${payload.event.type}. Attempt ${attempt}`, err);
             
-            // Log failure
-            await cloudService.saveWebhookLog({
-                event_type: payload.event.type,
-                payload: payload,
-                status_code: 0, // Network error
-                response_body: err.message
-            });
+            // Log failure directly
+            try {
+                await supabase.from('webhook_logs').insert({
+                    event_type: payload.event.type,
+                    payload: payload,
+                    status_code: 0, // Network error
+                    response_body: err.message
+                });
+            } catch(e) {}
 
             this.retry(url, payload, attempt);
         }

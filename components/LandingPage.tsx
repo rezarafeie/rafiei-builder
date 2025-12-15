@@ -2,7 +2,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { User } from '../types';
-import { cloudService } from '../services/cloudService';
+import { cloudService, supabase } from '../services/cloudService';
 import { useTranslation } from '../utils/translations';
 import AuthModal from './AuthModal';
 import PromptInputBox from './PromptInputBox';
@@ -16,6 +16,7 @@ const LandingPage: React.FC = () => {
   const [isAuthModalOpen, setAuthModalOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [dynamicAdjective, setDynamicAdjective] = useState('amazing');
+  const [isSystemOnline, setIsSystemOnline] = useState(true);
   const { t, dir } = useTranslation();
 
   useEffect(() => {
@@ -25,12 +26,31 @@ const LandingPage: React.FC = () => {
     // Check for existing user session
     cloudService.getCurrentUser().then(setUser);
 
+    // Check System Status with Timeout to ensure red dot appears on hang
+    const checkSystem = async () => {
+        try {
+            // Lightweight check to verify DB connectivity
+            const checkPromise = supabase.from('projects').select('count', { count: 'exact', head: true });
+            // Reject after 5 seconds to show offline status quickly if hung
+            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000));
+            
+            const result = await Promise.race([checkPromise, timeoutPromise]) as any;
+            
+            if (result.error) throw result.error;
+            setIsSystemOnline(true);
+        } catch (e) {
+            console.error("System offline:", e);
+            setIsSystemOnline(false);
+        }
+    };
+    checkSystem();
+
     // Listen for auth state changes just to update UI if needed (App.tsx handles routing)
-    const unsubscribe = cloudService.onAuthStateChange((user) => {
+    const subscription = cloudService.onAuthStateChange((user) => {
         setUser(user);
     });
 
-    return () => unsubscribe();
+    return () => subscription.unsubscribe();
   }, []);
 
   const handleSendMessage = async (content: string, images: { url: string; base64: string }[]) => {
@@ -75,6 +95,10 @@ const LandingPage: React.FC = () => {
                 <Rocket size={24} className="text-indigo-600 dark:text-indigo-400" />
             </div>
             <span className="text-xl font-bold tracking-tight text-slate-900 dark:text-white">Rafiei Builder</span>
+            <div 
+                className={`w-2 h-2 rounded-full ml-1 ${isSystemOnline ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.5)]'}`} 
+                title={isSystemOnline ? "System Online" : "System Offline"}
+            ></div>
         </div>
         <div className="flex items-center gap-4">
             {user ? (

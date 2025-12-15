@@ -42,7 +42,7 @@ const CreditBalanceModal: React.FC<CreditBalanceModalProps> = ({ user, onClose }
                 setIsRateLoading(false);
             });
         } else {
-            setRate(1); // 1 Credit = 1 USD
+            setRate(0.1); // 1 USD = 10 Credits => 1 Credit = 0.1 USD
         }
     }, [lang, activeTab]);
 
@@ -166,8 +166,8 @@ const CreditBalanceModal: React.FC<CreditBalanceModalProps> = ({ user, onClose }
                                 {isRateLoading ? <div className="flex items-center gap-2"><Loader2 className="animate-spin text-indigo-500" size={16} /><span className="text-xs text-slate-400">Fetching rate...</span></div> : (
                                     <span className="text-xl font-bold text-slate-900 dark:text-white">
                                         {lang === 'fa' && rate
-                                            ? `${(parseFloat(buyAmount || '0') * rate).toLocaleString()} ${t('toman')}`
-                                            : `$${parseFloat(buyAmount || '0').toFixed(2)}`
+                                            ? `${(parseFloat(buyAmount || '0') * (rate / 10)).toLocaleString()} ${t('toman')}` // Divide by 10 for credits
+                                            : `$${(parseFloat(buyAmount || '0') * (rate || 0)).toFixed(2)}`
                                         }
                                     </span>
                                 )}

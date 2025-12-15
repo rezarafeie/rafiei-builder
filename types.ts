@@ -10,17 +10,36 @@ export interface Phase {
   id: string;
   title: string;
   description: string;
-  status: 'pending' | 'active' | 'completed' | 'failed';
+  status: 'pending' | 'active' | 'completed' | 'failed' | 'skipped' | 'retrying';
   retryCount: number;
+  type: 'skeleton' | 'ui' | 'logic' | 'backend'; // Prioritization
+  durationMs?: number;
+}
+
+export interface BuildAudit {
+  score: number; // 0-100
+  passed: boolean;
+  issues: {
+    severity: 'critical' | 'warning';
+    message: string;
+    component?: string;
+  }[];
+  previewHealth: 'healthy' | 'blank' | 'error';
+  routesDetected: string[];
 }
 
 export interface BuildState {
-  plan: string[];
+  plan: string[]; // Legacy support
+  phases: Phase[]; // Primary Source of Truth now
+  currentPhaseIndex: number;
   currentStep: number;
   lastCompletedStep: number;
   error: string | null;
-  phases?: Phase[];
-  currentPhaseIndex?: number;
+  audit?: BuildAudit;
+  startTime?: number;
+  totalSteps?: number;
+  completedSteps?: number;
+  logs?: string[]; // Granular process logs
 }
 
 export interface ProjectFile {
@@ -41,10 +60,13 @@ export interface Message {
     title: string;
     plan: string[];
     status: 'completed' | 'failed';
+    audit?: BuildAudit;
   };
   requiresAction?: string;
   executionTimeMs?: number;
   creditsUsed?: number;
+  providerUsed?: string;
+  modelUsed?: string;
 }
 
 export interface RafieiCloudProject {
@@ -58,6 +80,16 @@ export interface RafieiCloudProject {
   publishableKey?: string;
   secretKey?: string;
   createdAt: number;
+}
+
+export interface VercelConfig {
+  projectId: string;
+  projectName: string;
+  productionUrl?: string; // stable {slug}.built.bnets.co
+  latestDeploymentId?: string;
+  latestDeploymentUrl?: string; // the vercel.app url
+  targetDomain?: string; // custom domain if set
+  lastDeployedAt: number;
 }
 
 export interface Project {
@@ -79,6 +111,7 @@ export interface Project {
     key: string;
   };
   rafieiCloudProject?: RafieiCloudProject;
+  vercelConfig?: VercelConfig;
 }
 
 export interface User {
@@ -96,10 +129,12 @@ export interface User {
 export interface Domain {
   id: string;
   domainName: string;
-  isPrimary: boolean;
-  dnsRecordType: string;
+  projectId: string;
+  type: 'root' | 'subdomain';
+  dnsRecordType: 'A' | 'CNAME' | 'ALIAS';
   dnsRecordValue: string;
   status: 'verified' | 'pending' | 'error';
+  updatedAt: number;
 }
 
 export interface Suggestion {
@@ -129,6 +164,7 @@ export interface CreditLedgerEntry {
   profitMargin: number;
   creditsDeducted: number;
   createdAt: number;
+  meta?: any; // Stores detailed logs, prompts, and provider details
 }
 
 export interface CreditTransaction {
@@ -175,3 +211,72 @@ export interface WebhookLog {
 }
 
 export type ViewMode = 'preview' | 'code';
+
+// AI Provider Types
+export type AIProviderId = 'google' | 'openai' | 'claude';
+
+export interface AIProviderConfig {
+    id: AIProviderId;
+    name: string;
+    isActive: boolean;
+    isFallback: boolean;
+    apiKey?: string; // Only used when sending to API, hidden in UI
+    model: string;
+    updatedAt: number;
+}
+
+export interface AIUsageResult {
+    promptTokens: number;
+    completionTokens: number;
+    costUsd: number;
+    provider: AIProviderId;
+    model: string;
+}
+
+// --- NEW ARCHITECTURE TYPES ---
+
+export interface DecisionJSON {
+  project_analysis: {
+    summary: string;
+    complexity: 'low' | 'medium' | 'high';
+  };
+  backend_detection: {
+    needs_backend: boolean;
+    required_backend_features: string[];
+  };
+  delivery_strategy: {
+    frontend_first_milestone: {
+      goal: string;
+    };
+  };
+  flow_plan: {
+    phases: {
+      phase: string;
+      outputs: string[];
+      condition?: string;
+    }[];
+  };
+}
+
+export interface DesignSpecJSON {
+  design_language: any;
+  pages: { route: string; name: string; sections: string[] }[];
+  navigation: any;
+}
+
+export interface FilePlanJSON {
+  file_structure: { path: string; purpose: string }[];
+  build_order: string[];
+}
+
+export interface FileChange {
+  path: string;
+  action: 'create' | 'update' | 'delete';
+  content: string;
+}
+
+export interface QAJSON {
+  status: 'pass' | 'fail';
+  issues: { type: string; message: string; file: string; hint: string }[];
+  patches?: FileChange[];
+}

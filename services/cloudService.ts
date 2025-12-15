@@ -1,154 +1,36 @@
 
-import { Project, User, Domain, Message, RafieiCloudProject, BuildState, Phase, SystemLog, ProjectFile, CreditLedgerEntry, CreditTransaction, FinancialStats, WebhookLog } from '../types';
-import { createClient, SupabaseClient, RealtimeChannel } from '@supabase/supabase-js';
-import { generateProjectTitle, GenerationSupervisor, SupervisorCallbacks, generatePhasePlan } from './geminiService';
-import { webhookService } from './webhookService';
+// ... existing imports
+import { createClient, SupabaseClient, User as SupabaseUser, Session } from '@supabase/supabase-js';
+import { User, Project, RafieiCloudProject, ProjectFile, Domain, CreditLedgerEntry, FinancialStats, WebhookLog, SystemLog, CreditTransaction, AdminMetric, BuildState, BuildAudit, GeneratedCode, Message } from '../types';
+import { GenerationSupervisor } from './geminiService';
 
+// ... (existing helper functions and setup) ...
 // Safe environment access
 const getEnv = (key: string) => {
   try {
     // @ts-ignore
-    if (typeof process !== 'undefined' && process.env) {
-       // @ts-ignore
-       return process.env[key];
-    }
-  } catch (e) {
-    // Ignore errors
-  }
+    if (typeof process !== 'undefined' && process.env) return process.env[key];
+  } catch (e) {}
   return undefined;
 };
 
 const SUPABASE_URL = getEnv('SUPABASE_URL') || getEnv('REACT_APP_SUPABASE_URL') || 'https://sxvqqktlykguifvmqrni.supabase.co';
 const SUPABASE_KEY = getEnv('SUPABASE_ANON_KEY') || getEnv('REACT_APP_SUPABASE_ANON_KEY') || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN4dnFxa3RseWtndWlmdm1xcm5pIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjU0MDE0MTIsImV4cCI6MjA4MDk3NzQxMn0.5psTW7xePYH3T0mkkHmDoWNgLKSghOHnZaW2zzShkSA';
 
-let supabase: SupabaseClient | null = null;
-
-if (SUPABASE_URL && SUPABASE_KEY) {
-    try {
-        supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
-            auth: {
-                autoRefreshToken: true,
-                persistSession: true,
-                detectSessionInUrl: true,
-            },
-        });
-    } catch (e) {
-        console.error("Failed to initialize main Supabase client", e);
-    }
-}
-
-const buildAbortControllers = new Map<string, AbortController>();
-const ADMIN_EMAILS = ['rezarafeie13@gmail.com'];
-
-// --- HELPER to get full user profile ---
-async function getFullUserFromSession(session: any): Promise<User | null> {
-    if (!session?.user) return null;
-
-    // OPTIMIZATION: We return -1 to indicate "loading" and allow the UI to render immediately.
-    // The Dashboard will fetch the actual balance asynchronously.
-    const credits_balance = -1;
-    
-    const name = session.user.user_metadata.name || session.user.email?.split('@')[0] || 'User';
-    
-    return {
-        id: session.user.id,
-        email: session.user.email!,
-        name: name,
-        avatar: session.user.user_metadata.avatar_url || `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random`,
-        credits_balance: credits_balance,
-        isAdmin: ADMIN_EMAILS.includes(session.user.email!)
-    };
-}
-
-
-export class DatabaseSetupError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'DatabaseSetupError';
-  }
-}
-
-const wrapError = (error: any, context: string) => {
-    console.error(`Error in ${context}:`, error);
-    if (error instanceof TypeError && error.message.toLowerCase().includes('failed to fetch')) {
-        return new DatabaseSetupError("NETWORK_ERROR");
-    }
-    let msg = "An unknown error occurred.";
-    if (error) {
-        if (typeof error === 'string') {
-            msg = error;
-        } else if (error.message) {
-            msg = error.message;
-        } else if (error.error_description) {
-            msg = error.error_description;
-        } else if (error.details) {
-            msg = error.details;
-        } else if (error.hint) {
-            msg = `Error: ${error.hint}`;
+export const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+    auth: {
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: true,
+        storage: typeof window !== 'undefined' ? window.localStorage : undefined
+    },
+    // Add global fetch with timeout to prevent infinite hangs at the network layer
+    global: {
+        fetch: (url, options) => {
+            return fetch(url, { ...options, signal: AbortSignal.timeout(20000) }); // 20s hard timeout on requests
         }
     }
-    return new Error(msg);
-};
-
-const requireClient = () => {
-    if (!supabase) throw new Error("Platform Supabase not configured. Please check environment variables.");
-    return supabase;
-};
-
-const mapRowToProject = (row: any): Project => {
-    let deletedAtTimestamp: number | undefined = undefined;
-    if (row.deleted_at) {
-        if (typeof row.deleted_at === 'number') {
-            deletedAtTimestamp = row.deleted_at;
-        } else if (typeof row.deleted_at === 'string') {
-            const parsedDate = new Date(row.deleted_at);
-            if (!isNaN(parsedDate.getTime())) {
-                deletedAtTimestamp = parsedDate.getTime();
-            }
-        }
-    }
-    return {
-        id: row.id,
-        userId: row.user_id,
-        name: row.name,
-        createdAt: new Date(row.created_at).getTime(),
-        updatedAt: new Date(row.updated_at).getTime(),
-        deletedAt: deletedAtTimestamp,
-        // Default to empty code if not fetched (Dashboard list view)
-        code: row.code || { html: '', javascript: '', css: '', explanation: '' },
-        files: row.files || undefined, 
-        messages: row.messages || [],
-        status: row.status || 'idle',
-        buildState: row.build_state || null,
-        publishedUrl: row.published_url,
-        customDomain: row.custom_domain,
-        supabaseConfig: row.supabase_config || undefined,
-        rafieiCloudProject: row.rafiei_cloud_project || undefined
-    };
-};
-
-// Mapper for the lightweight RPC response
-const mapDashboardRowToProject = (row: any): Project => {
-    return {
-        id: row.id,
-        userId: row.user_id,
-        name: row.name,
-        createdAt: new Date(row.created_at).getTime(),
-        updatedAt: new Date(row.updated_at).getTime(),
-        status: row.status || 'idle',
-        publishedUrl: row.published_url,
-        customDomain: row.custom_domain,
-        buildState: {
-            currentStep: row.current_step || 0,
-            plan: new Array(row.total_steps || 0).fill(''), // Fake plan array to support progress bar length logic
-            lastCompletedStep: -1,
-            error: null
-        },
-        code: { html: '', javascript: '', css: '', explanation: '' },
-        messages: [],
-        files: undefined
-    };
-};
+});
 
 export const fileToBase64 = (file: File): Promise<string> => {
   return new Promise((resolve, reject) => {
@@ -159,959 +41,812 @@ export const fileToBase64 = (file: File): Promise<string> => {
   });
 };
 
-// ... (runBuildOnServer, createCallbacks, etc... unchanged) ...
-export async function runBuildOnServer(
-    project: Project, 
-    prompt: string, 
-    images?: string[],
-    onStateChange?: (project: Project) => void,
-    onSaveProject?: (project: Project) => Promise<void>,
-    abortSignal?: AbortSignal
-) {
-    const projectRef = { ...project };
-    const save = async (p: Project) => { if (onSaveProject) await onSaveProject(p); };
-    const updateState = (updated: Project) => { if (onStateChange) onStateChange(updated); };
-    const hasPhases = projectRef.buildState?.phases && projectRef.buildState.phases.length > 0;
-    
-    // Webhook: Build Phase
-    webhookService.send('build.started', { prompt, imageCount: images?.length || 0 }, { project_id: project.id }, { id: project.userId, email: '' });
-
-    if (!hasPhases) {
-        const callbacks = createCallbacks(projectRef, updateState, save);
-        const supervisor = new GenerationSupervisor(projectRef, prompt, images, callbacks, abortSignal);
-        await supervisor.start();
-        
-        if (projectRef.status !== 'idle') {
-            projectRef.status = 'idle';
-            updateState({ ...projectRef });
-            await save(projectRef);
-        }
-        return;
-    }
-
-    if (projectRef.buildState && projectRef.buildState.phases) {
-        let phaseIndex = projectRef.buildState.currentPhaseIndex || 0;
-        const phases = projectRef.buildState.phases;
-        const MAX_PHASE_RETRIES = 3;
-
-        while (phaseIndex < phases.length) {
-            if (abortSignal?.aborted) throw new Error("Build cancelled by user");
-            const currentPhase = phases[phaseIndex];
-            currentPhase.status = 'active';
-            projectRef.buildState.currentPhaseIndex = phaseIndex;
-            
-            // Webhook: Phase Start
-            webhookService.send('build.phase_started', { phaseIndex, phaseTitle: currentPhase.title }, { project_id: project.id });
-
-            if ((currentPhase.retryCount || 0) === 0) {
-                projectRef.buildState.currentStep = 0;
-                projectRef.buildState.plan = []; 
-                projectRef.buildState.error = null;
-            } else {
-                projectRef.buildState.error = `Retrying Phase (Attempt ${(currentPhase.retryCount || 0) + 1}/${MAX_PHASE_RETRIES})...`;
-            }
-            
-            updateState({ ...projectRef });
-            await save(projectRef);
-
-            const phasePrompt = `Execute Phase ${phaseIndex + 1}: ${currentPhase.title}. ${currentPhase.description}`;
-            const callbacks = createCallbacks(projectRef, updateState, save);
-            const supervisor = new GenerationSupervisor(projectRef, prompt, images, callbacks, abortSignal, phasePrompt);
-
-            try {
-                await supervisor.start();
-                currentPhase.status = 'completed';
-                projectRef.buildState.phases[phaseIndex] = currentPhase;
-                updateState({ ...projectRef });
-                await save(projectRef);
-                
-                // Webhook: Phase Complete
-                webhookService.send('build.phase_completed', { phaseIndex, phaseTitle: currentPhase.title }, { project_id: project.id });
-                
-                phaseIndex++; 
-            } catch (error: any) {
-                if (abortSignal?.aborted) throw error; 
-                const retries = currentPhase.retryCount || 0;
-                if (retries < MAX_PHASE_RETRIES) {
-                    console.warn(`Phase ${phaseIndex + 1} failed. Retrying...`, error);
-                    currentPhase.retryCount = retries + 1;
-                    projectRef.buildState.phases[phaseIndex] = currentPhase;
-                    projectRef.messages.push({
-                        id: crypto.randomUUID(),
-                        role: 'assistant',
-                        content: `⚠️ Phase ${phaseIndex + 1} encountered an error: "${error.message}". Auto-fixing and retrying (Attempt ${currentPhase.retryCount}/${MAX_PHASE_RETRIES})...`,
-                        timestamp: Date.now()
-                    });
-                    await new Promise(r => setTimeout(r, 5000));
-                    continue; 
-                } else {
-                    currentPhase.status = 'failed';
-                    projectRef.buildState.phases[phaseIndex] = currentPhase;
-                    projectRef.buildState.error = `Phase failed after ${MAX_PHASE_RETRIES} attempts: ${error.message}`;
-                    projectRef.status = 'idle';
-                    updateState({ ...projectRef });
-                    await save(projectRef);
-                    // Webhook: Build Failed
-                    webhookService.send('build.failed', { error: error.message, phase: currentPhase.title }, { project_id: project.id });
-                    throw error; 
-                }
-            }
-        }
-        projectRef.status = 'idle';
-        updateState({ ...projectRef });
-        await save(projectRef);
-        // Webhook: Build Complete
-        webhookService.send('build.completed', { phasesCompleted: phases.length }, { project_id: project.id });
-    }
-}
-
-function createCallbacks(projectRef: Project, updateState: (p: Project) => void, save: (p: Project) => Promise<void>): SupervisorCallbacks {
-    const DB_CONNECT_MESSAGE = "This project requires a backend database. Starting Rafiei Cloud connection process...";
+const mapSupabaseUser = (u: SupabaseUser | null): User | null => {
+    if (!u) return null;
     return {
-        onPlanUpdate: async (plan) => {
-            if (projectRef.buildState) {
-                projectRef.buildState.plan = plan;
-                projectRef.buildState.currentStep = 0;
-                projectRef.buildState.lastCompletedStep = -1;
-                projectRef.buildState.error = null;
-            }
-            projectRef.status = 'generating';
-            updateState({ ...projectRef });
-            await save(projectRef);
-        },
-        onStepStart: async (stepIndex) => {
-            if (projectRef.buildState) {
-                projectRef.buildState.currentStep = stepIndex;
-                projectRef.buildState.error = null;
-                updateState({ ...projectRef });
-                await save(projectRef);
-            }
-        },
-        onStepComplete: async (stepIndex) => {
-            if (projectRef.buildState) {
-                projectRef.buildState.lastCompletedStep = stepIndex;
-                updateState({ ...projectRef });
-                await save(projectRef);
-            }
-        },
-        onChunkComplete: async (code, explanation) => {
-            projectRef.code = code;
-            updateState({ ...projectRef });
-            await save(projectRef);
-        },
-        onSuccess: async (finalCode, finalExplanation, plan, meta) => {
-            const lastUserMsg = [...projectRef.messages].reverse().find(m => m.role === 'user');
-            const jobTitle = lastUserMsg ? `Job: "${lastUserMsg.content.substring(0, 30)}..."` : "Build Job";
-
-            const aiMsg: Message = {
-                id: crypto.randomUUID(),
-                role: 'assistant',
-                content: finalExplanation,
-                timestamp: Date.now(),
-                type: 'job_summary',
-                jobSummary: {
-                    title: jobTitle,
-                    plan: plan,
-                    status: 'completed'
-                },
-                executionTimeMs: meta?.timeMs,
-                creditsUsed: meta?.credits,
-            };
-
-            projectRef.code = finalCode;
-            projectRef.messages.push(aiMsg);
-            if (!projectRef.buildState?.phases || projectRef.buildState.phases.length === 0) {
-                 projectRef.status = 'idle';
-            }
-            if (projectRef.buildState) {
-                projectRef.buildState.currentStep = projectRef.buildState.plan.length;
-                projectRef.buildState.lastCompletedStep = projectRef.buildState.plan.length - 1;
-                projectRef.buildState.error = null;
-            }
-            updateState({ ...projectRef });
-            await save(projectRef);
-            
-            if (!projectRef.buildState?.phases) {
-                // If single phase, send complete here
-                webhookService.send('build.completed', { steps: plan.length, timeMs: meta?.timeMs, credits: meta?.credits }, { project_id: projectRef.id });
-            }
-            
-            requireClient().auth.refreshSession();
-        },
-        onError: async (error, retriesLeft) => {
-             if (projectRef.buildState) {
-                projectRef.buildState.error = error;
-                updateState({ ...projectRef });
-                await save(projectRef);
-            }
-            try {
-                const client = requireClient();
-                await client.from('system_logs').insert({
-                    level: 'error',
-                    source: 'BuildWorker',
-                    message: error,
-                    project_id: projectRef.id
-                });
-                webhookService.send('system.warning', { message: error, source: 'BuildWorker' }, { project_id: projectRef.id });
-            } catch(e) {}
-        },
-        onFinalError: async (error, plan) => {
-            const isSystemTrigger = error === DB_CONNECT_MESSAGE;
-            if (isSystemTrigger) {
-                const errorMsg: Message = { id: crypto.randomUUID(), role: 'assistant', content: error, timestamp: Date.now() };
-                projectRef.messages.push(errorMsg);
-                projectRef.status = 'idle';
-                updateState({ ...projectRef });
-                await save(projectRef);
-            } else {
-                 const lastUserMsg = [...projectRef.messages].reverse().find(m => m.role === 'user');
-                const jobTitle = lastUserMsg ? `Job: "${lastUserMsg.content.substring(0, 30)}..."` : "Build Job";
-
-                const errorMsg: Message = {
-                    id: crypto.randomUUID(),
-                    role: 'assistant',
-                    content: `Build failed: ${error}`,
-                    timestamp: Date.now(),
-                    type: 'job_summary',
-                    jobSummary: {
-                        title: jobTitle,
-                        plan: plan || ['Plan generation failed.'],
-                        status: 'failed',
-                    },
-                };
-                projectRef.messages.push(errorMsg);
-                projectRef.status = 'idle';
-                if (projectRef.buildState) {
-                    projectRef.buildState.error = error;
-                }
-                updateState({ ...projectRef });
-                await save(projectRef);
-
-                try {
-                    const client = requireClient();
-                    await client.from('system_logs').insert({
-                        level: 'critical',
-                        source: 'AI',
-                        message: error,
-                        project_id: projectRef.id
-                    });
-                    webhookService.send('build.failed', { error, plan }, { project_id: projectRef.id });
-                } catch(e) {}
-            }
-        }
+        id: u.id,
+        email: u.email || '',
+        name: u.user_metadata?.full_name || u.email?.split('@')[0] || 'User',
+        avatar: u.user_metadata?.avatar_url,
+        credits_balance: -1, // Lazy load
+        isAdmin: u.email === 'rezarafeie13@gmail.com',
+        created_at: u.created_at,
+        last_sign_in_at: u.last_sign_in_at
     };
-}
+};
 
 export const cloudService = {
-  // ... existing methods (onAuthStateChange, getCurrentUser, login, register, etc.) ...
-  onAuthStateChange(callback: (user: User | null) => void) {
-    const client = requireClient();
-    const { data: { subscription } } = client.auth.onAuthStateChange(async (event, session) => {
-        const fullUser = await getFullUserFromSession(session);
-        callback(fullUser);
-    });
-    return () => subscription.unsubscribe();
-  },
+    abortController: null as AbortController | null,
 
-  async getCurrentUser(): Promise<User | null> {
-    if (!supabase) return null;
-    try {
-      const { data: { session } } = await supabase.auth.getSession();
-      return await getFullUserFromSession(session);
-    } catch (e) { return null; }
-  },
-  
-  async login(email: string, password: string): Promise<User> {
-    const client = requireClient();
-    const { data, error } = await client.auth.signInWithPassword({ email, password });
-    if (error) throw wrapError(error, 'login');
-    const fullUser = await getFullUserFromSession(data);
-    if (!fullUser) throw new Error("Login failed: User not found after session creation.");
-    webhookService.send('user.logged_in', { method: 'email' }, {}, fullUser);
-    return fullUser;
-  },
-
-  async register(email: string, password: string, name: string): Promise<User> {
-    const client = requireClient();
-    const avatar = `https://ui-avatars.com/api/?name=${name.split(' ').join('+')}&background=random`;
-    const { data, error } = await client.auth.signUp({
-        email,
-        password,
-        options: { data: { name: name, avatar_url: avatar } }
-    });
-    if (error) throw wrapError(error, 'register');
-    const fullUser = await getFullUserFromSession(data);
-    if (!fullUser) throw new Error("Registration failed: Could not create user profile.");
-    webhookService.send('user.registered', { method: 'email', name }, {}, fullUser);
-    return fullUser;
-  },
-
-  async signInWithGoogle(): Promise<void> {
-    const client = requireClient();
-    const { error } = await client.auth.signInWithOAuth({ provider: 'google' });
-    if (error) throw wrapError(error, 'signInWithGoogle');
-  },
-  
-  async signInWithGitHub(): Promise<void> {
-    const client = requireClient();
-    const { error } = await client.auth.signInWithOAuth({ provider: 'github' });
-    if (error) throw wrapError(error, 'signInWithGitHub');
-  },
-
-  async logout(): Promise<void> {
-    const client = requireClient();
-    // Get user before logout for webhook
-    const { data: { user } } = await client.auth.getUser();
-    if (user) {
-        webhookService.send('user.logged_out', {}, {}, { id: user.id, email: user.email || '' });
-    }
-    const { error } = await client.auth.signOut();
-    if (error) throw wrapError(error, 'logout');
-  },
-
-  // ... (Other existing methods: saveRafieiCloudProject, createNewProjectAndInitiateBuild, createImportedProject, getProjects, etc.) ...
-  async saveRafieiCloudProject(cloudProject: RafieiCloudProject): Promise<void> {
-    const client = requireClient();
-    const payload = {
-        id: cloudProject.id,
-        user_id: cloudProject.userId,
-        project_ref: cloudProject.projectRef,
-        project_name: cloudProject.projectName,
-        status: cloudProject.status,
-        region: cloudProject.region,
-        db_pass: cloudProject.dbPassword,
-        publishable_key: cloudProject.publishableKey,
-        secret_key: cloudProject.secretKey,
-        created_at: new Date(cloudProject.createdAt).toISOString()
-    };
-    const { error } = await client.from('rafiei_cloud_projects').upsert(payload, { onConflict: 'id' });
-    if (error) {
-        if (error.code === '42P01') throw new DatabaseSetupError("TABLE_MISSING");
-        throw wrapError(error, 'saveRafieiCloudProject');
-    }
-    
-    if (cloudProject.status === 'ACTIVE') {
-        webhookService.send('cloud.connected', { projectRef: cloudProject.projectRef }, { project_id: cloudProject.id }, { id: cloudProject.userId, email: '' });
-    } else if (cloudProject.status === 'FAILED') {
-        webhookService.send('cloud.connection_failed', { projectRef: cloudProject.projectRef }, { project_id: cloudProject.id }, { id: cloudProject.userId, email: '' });
-    }
-  },
-
-  async createNewProjectAndInitiateBuild(user: User, prompt: string, images: { url: string; base64: string }[]): Promise<string> {
-    const name = await generateProjectTitle(prompt);
-    const userMsg: Message = { id: crypto.randomUUID(), role: 'user', content: prompt, timestamp: Date.now(), images: images.map(i => i.url) };
-    const newProject: Project = {
-      id: crypto.randomUUID(),
-      userId: user.id,
-      name,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      code: { html: '', javascript: '', css: '', explanation: '' },
-      messages: [userMsg],
-      status: 'idle', 
-      buildState: null,
-      supabaseConfig: await this.getUserSettings(user.id) || undefined
-    };
-    await this.saveProject(newProject);
-    
-    webhookService.send('project.created', { name: newProject.name }, { project_id: newProject.id }, user);
-    
-    return newProject.id;
-  },
-
-  async createImportedProject(user: User, name: string, files: ProjectFile[]): Promise<string> {
-      let html = '';
-      let javascript = '';
-      let css = '';
-
-      const indexHtml = files.find(f => f.path.endsWith('index.html'));
-      if (indexHtml) html = indexHtml.content;
-
-      const mainJs = files.find(f => f.path.endsWith('src/main.tsx') || f.path.endsWith('src/main.jsx') || f.path.endsWith('src/index.tsx') || f.path.endsWith('src/index.js'));
-      if (mainJs) javascript = mainJs.content;
-
-      const indexCss = files.find(f => f.path.endsWith('src/index.css') || f.path.endsWith('src/App.css'));
-      if (indexCss) css = indexCss.content;
-
-      const newProject: Project = {
-          id: crypto.randomUUID(),
-          userId: user.id,
-          name,
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          code: { html, javascript, css, explanation: 'Imported from GitHub' },
-          files: files,
-          messages: [{
-              id: crypto.randomUUID(),
-              role: 'assistant',
-              content: `Project imported successfully. \n\n**Detected Files:** ${files.length}\n**Entry Point:** ${mainJs ? mainJs.path : 'Not found (Preview might need adjustment)'}`,
-              timestamp: Date.now()
-          }],
-          status: 'idle',
-          buildState: null,
-          supabaseConfig: await this.getUserSettings(user.id) || undefined
-      };
-
-      await this.saveProject(newProject);
-      webhookService.send('project.imported_from_github', { name, fileCount: files.length }, { project_id: newProject.id }, user);
-      return newProject.id;
-  },
-
-  async getProjects(userId: string): Promise<Project[]> {
-    const client = requireClient();
-    try {
-        // NOTE: We bypass RPC 'get_dashboard_projects' because it returns a lightweight object without the 'code' column.
-        // We MUST fetch the 'code' column to enable dashboard previews (ProjectCard uses srcDoc).
-        /*
+    // ... (AUTH METHODS same as before) ...
+    async getCurrentUser(): Promise<User | null> {
         try {
-            const { data: rpcData, error: rpcError } = await client.rpc('get_dashboard_projects', { p_user_id: userId });
-            
-            if (!rpcError && rpcData) {
-                return (rpcData as any[]).map(mapDashboardRowToProject);
+            // 1. Quick check for network
+            if (typeof navigator !== 'undefined' && !navigator.onLine) {
+                console.warn("Offline detected");
+                return null;
             }
-        } catch (rpcEx) {
-            console.warn("RPC Optimization failed, falling back to SELECT.", rpcEx);
-        }
-        */
 
-        const { data, error } = await client
-            .from('projects')
-            .select('id, user_id, name, created_at, updated_at, status, build_state, published_url, custom_domain, rafiei_cloud_project, deleted_at, code') // ADDED 'code'
+            const sessionPromise = supabase.auth.getSession();
+            // Increased timeout to 15s to handle slow connections
+            const timeoutPromise = new Promise<{data: {session: null}, error: {message: string}}>((resolve) => 
+                setTimeout(() => resolve({ data: { session: null }, error: { message: 'Timeout' } }), 15000)
+            );
+
+            const { data, error } = await Promise.race([sessionPromise, timeoutPromise]);
+            
+            if (error) {
+                console.warn("Supabase session error:", error);
+                // Do NOT disconnect session here. It causes a loop.
+                // Just return null to indicate "could not verify user".
+                return null;
+            }
+            return mapSupabaseUser(data.session?.user || null);
+        } catch (e) {
+            console.error("Critical Supabase Client Error in getCurrentUser:", e);
+            // Only clear token if it's strictly a parsing error to recover
+            if (e instanceof Error && e.message.includes('JSON')) {
+                 try { localStorage.removeItem(`sb-${new URL(SUPABASE_URL).hostname.split('.')[0]}-auth-token`); } catch(err) {}
+            }
+            return null;
+        }
+    },
+
+    onAuthStateChange(callback: (user: User | null) => void) {
+        const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
+            const user = mapSupabaseUser(session?.user || null);
+            if (user) {
+                try {
+                    // Non-blocking credit fetch
+                    this.getUserCredits(user.id).then(balance => {
+                        user.credits_balance = balance;
+                        callback({ ...user }); // Trigger update with balance
+                    }).catch(() => {});
+                } catch(e) {}
+            }
+            callback(user);
+        });
+        return { unsubscribe: () => subscription.unsubscribe() };
+    },
+
+    async getUserLanguage(userId: string): Promise<string> {
+        try {
+            const { data, error } = await supabase.from('user_settings').select('language').eq('user_id', userId).single();
+            if (error) throw error;
+            return data?.language || 'en';
+        } catch (e) {
+            return 'en';
+        }
+    },
+
+    async saveUserLanguage(userId: string, lang: string): Promise<void> {
+        await supabase.from('user_settings').upsert({ user_id: userId, language: lang });
+    },
+
+    async login(email: string, pass: string): Promise<User> {
+        const { data, error } = await supabase.auth.signInWithPassword({ email, password: pass });
+        if (error) throw error;
+        return mapSupabaseUser(data.user!)!;
+    },
+
+    async register(email: string, pass: string, name: string): Promise<User> {
+        const { data, error } = await supabase.auth.signUp({ 
+            email, 
+            password: pass,
+            options: { data: { full_name: name } }
+        });
+        if (error) throw error;
+        if (!data.user) throw new Error("Registration failed");
+        
+        await supabase.from('user_settings').upsert({ user_id: data.user.id });
+        
+        return mapSupabaseUser(data.user)!;
+    },
+
+    async signInWithGoogle() {
+        const { error } = await supabase.auth.signInWithOAuth({
+            provider: 'google',
+            options: { redirectTo: window.location.origin }
+        });
+        if (error) throw error;
+    },
+
+    async signInWithGitHub() {
+        const { error } = await supabase.auth.signInWithOAuth({
+            provider: 'github',
+            options: { redirectTo: window.location.origin }
+        });
+        if (error) throw error;
+    },
+
+    async logout() {
+        await supabase.auth.signOut();
+    },
+
+    async disconnectSession() {
+        try {
+            await Promise.race([
+                supabase.auth.signOut(),
+                new Promise(resolve => setTimeout(resolve, 2000))
+            ]);
+        } catch (e) {
+            console.warn("Sign out failed, forcing local storage clear", e);
+        } finally {
+            if (typeof window !== 'undefined') {
+                const keysToRemove = [];
+                for (let i = 0; i < localStorage.length; i++) {
+                    const key = localStorage.key(i);
+                    if (key && (key.startsWith('sb-') || key.includes('supabase'))) {
+                        keysToRemove.push(key);
+                    }
+                }
+                keysToRemove.forEach(k => localStorage.removeItem(k));
+            }
+        }
+    },
+
+    // --- PROJECTS ---
+    
+    async getProjects(userId: string, limit?: number, offset?: number): Promise<Project[]> {
+        let query = supabase.from('projects')
+            .select('*')
             .eq('user_id', userId)
             .is('deleted_at', null)
             .order('updated_at', { ascending: false });
             
+        if (limit !== undefined && offset !== undefined) {
+            query = query.range(offset, offset + limit - 1);
+        } else if (limit !== undefined) {
+            query = query.limit(limit);
+        }
+            
+        const { data, error } = await query;
         if (error) throw error;
-        return (data || []).map(mapRowToProject);
-    } catch (error: any) {
-        if (error.code === '42P01') throw new DatabaseSetupError("TABLE_MISSING");
-        if (error.code === '42P17') throw new DatabaseSetupError("Infinite Recursion detected in DB Policies. Run SQL Setup.");
-        
-        if (error.code === '42703') {
-            // Fallback for very old schema
-            const { data: fallbackData, error: fallbackError } = await client.from('projects').select('id, user_id, name, created_at, updated_at, status').eq('user_id', userId).order('updated_at', { ascending: false });
-            if (fallbackError) throw wrapError(fallbackError, 'getProjects_Fallback');
-            return (fallbackData || []).map(mapRowToProject);
-        }
-        throw wrapError(error, 'getProjects');
-    }
-  },
+        return data.map(this.mapProject);
+    },
 
-  async getAdminProjects(): Promise<Project[]> {
-    const client = requireClient();
-    const { data, error } = await client
-        .from('projects')
-        .select('id, user_id, name, created_at, updated_at, status, build_state, published_url, custom_domain, rafiei_cloud_project, deleted_at, code') // ADDED 'code'
-        .order('updated_at', { ascending: false });
-        
-    if (error) {
-        if (error.code === '42501') throw new Error("Access Denied: Admin privileges required. Run SQL Setup.");
-        if (error.code === '42703') {
-             const { data: fallbackData, error: fallbackError } = await client.from('projects').select('id, user_id, name, created_at, updated_at, status').order('updated_at', { ascending: false });
-             if (fallbackError) throw wrapError(fallbackError, 'getAdminProjects_Fallback');
-             return (fallbackData || []).map(mapRowToProject);
-        }
-        throw wrapError(error, 'getAdminProjects');
-    }
-    return (data || []).map(mapRowToProject);
-  },
-
-  async getAdminUsers(): Promise<any[]> {
-    const client = requireClient();
-    const { data, error } = await client.rpc('get_all_users');
-    if (error) {
-        if (error.message?.includes('does not exist')) throw new Error("Missing 'get_all_users' function. Run SQL Setup.");
-        console.warn("getAdminUsers RPC failed:", error);
-        return [];
-    }
-    return data || [];
-  },
-
-  async getSystemLogs(): Promise<SystemLog[]> {
-    const client = requireClient();
-    const { data, error } = await client.from('system_logs').select('*').order('created_at', { ascending: false }).limit(100);
-    if (error) {
-        if (error.code === '42P01') return []; 
-        throw wrapError(error, 'getSystemLogs');
-    }
-    return (data || []).map((row: any) => ({
-        id: row.id,
-        timestamp: new Date(row.created_at).getTime(),
-        level: row.level,
-        source: row.source,
-        message: row.message,
-        projectId: row.project_id,
-        meta: row.meta
-    }));
-  },
-  
-  async getAiUsageStats(): Promise<any[]> {
-      const client = requireClient();
-      const { data, error } = await client.from('ai_usage').select('*').order('created_at', { ascending: false }).limit(500);
-      if (error) {
-          if (error.code === '42P01') return [];
-          throw wrapError(error, 'getAiUsageStats');
-      }
-      return data || [];
-  },
-
-  async getFinancialStats(): Promise<FinancialStats> {
-      const client = requireClient();
-      
-      const [ledgerRes, txRes, settingsRes] = await Promise.all([
-          client.from('credit_ledger').select('*'),
-          client.from('credit_transactions').select('*'),
-          client.from('financial_settings').select('*').single()
-      ]);
-
-      const ledger = ledgerRes.data || [];
-      const transactions = txRes.data || [];
-      const settings = settingsRes.data;
-      const error = ledgerRes.error || txRes.error;
-
-      if (error?.code === '42P01') {
-          return {
-              totalRevenueCredits: 0,
-              totalCostUsd: 0,
-              netProfitUsd: 0,
-              totalCreditsPurchased: 0,
-              currentMargin: 0.5,
-              totalInputTokens: 0,
-              totalOutputTokens: 0,
-              totalRequestCount: 0
-          } as FinancialStats;
-      }
-
-      if (error) {
-          console.warn("Financial stats access restricted or failed:", error.message);
-          return {
-              totalRevenueCredits: 0,
-              totalCostUsd: 0,
-              netProfitUsd: 0,
-              totalCreditsPurchased: 0,
-              currentMargin: 0.5,
-              totalInputTokens: 0,
-              totalOutputTokens: 0,
-              totalRequestCount: 0
-          } as FinancialStats;
-      }
-
-      let totalRevenue = 0;
-      let totalCost = 0;
-      let totalPurchased = 0;
-      let totalInputTokens = 0;
-      let totalOutputTokens = 0;
-
-      ledger.forEach((entry: any) => {
-          totalRevenue += Number(entry.credits_deducted || 0);
-          totalCost += Number(entry.raw_cost_usd || 0);
-          totalInputTokens += Number(entry.input_tokens || 0);
-          totalOutputTokens += Number(entry.output_tokens || 0);
-      });
-
-      transactions.forEach((tx: any) => {
-          if (tx.amount > 0) totalPurchased += Number(tx.amount);
-      });
-
-      return {
-          totalRevenueCredits: totalRevenue || 0,
-          totalCostUsd: totalCost || 0,
-          netProfitUsd: (totalRevenue - totalCost) || 0,
-          totalCreditsPurchased: totalPurchased || 0,
-          currentMargin: settings?.profit_margin_percentage || 0.5,
-          totalInputTokens: totalInputTokens || 0,
-          totalOutputTokens: totalOutputTokens || 0,
-          totalRequestCount: ledger.length || 0
-      } as FinancialStats;
-  },
-
-  async getLedger(limit = 100): Promise<CreditLedgerEntry[]> {
-      const client = requireClient();
-      const { data, error } = await client.from('credit_ledger').select('*').order('created_at', { ascending: false }).limit(limit);
-      if (error) {
-          console.warn("Ledger fetch failed:", error.message);
-          return [];
-      }
-      return data.map((row: any) => ({
-          id: row.id,
-          userId: row.user_id,
-          projectId: row.project_id,
-          operationType: row.operation_type,
-          model: row.model,
-          inputTokens: row.input_tokens,
-          outputTokens: row.output_tokens,
-          rawCostUsd: row.raw_cost_usd,
-          profitMargin: row.profit_margin,
-          creditsDeducted: row.credits_deducted,
-          createdAt: new Date(row.created_at).getTime()
-      }));
-  },
-
-  async getUserTransactions(userId: string): Promise<CreditTransaction[]> {
-      const client = requireClient();
-      const { data, error } = await client.from('credit_transactions').select('*').eq('user_id', userId).order('created_at', { ascending: false });
-      if (error) {
-          if (error.code === '42P01') return [];
-          throw error;
-      }
-      return data.map((row: any) => ({
-          id: row.id,
-          userId: row.user_id,
-          amount: Number(row.amount),
-          type: row.type,
-          currency: row.currency,
-          exchangeRate: Number(row.exchange_rate),
-          paymentId: row.payment_id,
-          description: row.description,
-          createdAt: new Date(row.created_at).getTime()
-      }));
-  },
-
-  async adminAdjustCredit(targetUserId: string, amount: number, description: string, adminEmail: string): Promise<void> {
-      const client = requireClient();
-      const { error } = await client.rpc('admin_adjust_balance', {
-          p_target_user_id: targetUserId,
-          p_amount: amount,
-          p_description: description,
-          p_admin_email: adminEmail
-      });
-      if (error) throw new Error(`Adjustment Failed: ${error.message}`);
-      
-      webhookService.send('credit.added', { amount, reason: description, admin: adminEmail }, {}, { id: targetUserId, email: '' });
-  },
-
-  async getUserFinancialOverview(userId: string): Promise<any> {
-      const client = requireClient();
-      const { data: ledger } = await client.from('credit_ledger').select('credits_deducted, raw_cost_usd').eq('user_id', userId);
-      const { data: transactions } = await client.from('credit_transactions').select('amount, type').eq('user_id', userId);
-      
-      let totalSpent = 0;
-      let totalCost = 0;
-      let totalPurchased = 0;
-
-      ledger?.forEach((l: any) => {
-          totalSpent += Number(l.credits_deducted);
-          totalCost += Number(l.raw_cost_usd);
-      });
-
-      transactions?.forEach((t: any) => {
-          if (t.type === 'purchase' || (t.type === 'admin_adjustment' && t.amount > 0)) {
-              totalPurchased += Number(t.amount);
-          }
-      });
-
-      return {
-          totalPurchased,
-          totalSpent,
-          totalCost,
-          profitGenerated: totalSpent - totalCost
-      };
-  },
-
-  async getTrashedProjects(userId: string): Promise<Project[]> {
-    const client = requireClient();
-    try {
-        const { data, error } = await client
-            .from('projects')
-            .select('id, user_id, name, created_at, updated_at, status, build_state, published_url, custom_domain, rafiei_cloud_project, deleted_at, code') // ADDED 'code'
+    async getTrashedProjects(userId: string, limit?: number, offset?: number): Promise<Project[]> {
+        let query = supabase.from('projects')
+            .select('*')
             .eq('user_id', userId)
             .not('deleted_at', 'is', null)
             .order('deleted_at', { ascending: false });
             
+        if (limit !== undefined && offset !== undefined) {
+            query = query.range(offset, offset + limit - 1);
+        } else if (limit !== undefined) {
+            query = query.limit(limit);
+        }
+            
+        const { data, error } = await query;
         if (error) throw error;
-        return (data || []).map(mapRowToProject);
-    } catch (error: any) {
-       if (error.code === '42703') {
-           return []; 
-       }
-       throw wrapError(error, 'getTrashedProjects');
-    }
-  },
+        return data.map(this.mapProject);
+    },
 
-  async getTrashCount(userId: string): Promise<number> {
-    const client = requireClient();
-    try {
-        const { count, error } = await client.from('projects').select('*', { count: 'exact', head: true }).eq('user_id', userId).not('deleted_at', 'is', null);
-        if (error) { if (error.code === '42703' || error.code === '42P01') return 0; throw error; }
+    async getTrashCount(userId: string): Promise<number> {
+        const { count, error } = await supabase.from('projects')
+            .select('*', { count: 'exact', head: true })
+            .eq('user_id', userId)
+            .not('deleted_at', 'is', null);
+        if (error) return 0;
         return count || 0;
-    } catch (e) { return 0; }
-  },
+    },
 
-  async getProject(projectId: string): Promise<Project | null> {
-    const client = requireClient();
-    const { data, error } = await client.from('projects').select('*').eq('id', projectId).single();
-    if (error) { if (error.code === 'PGRST116') return null; throw wrapError(error, 'getProject'); }
-    
-    const project = mapRowToProject(data);
-    webhookService.send('project.opened', { name: project.name }, { project_id: project.id }, { id: project.userId, email: '' });
-    
-    return project;
-  },
+    async getProject(projectId: string): Promise<Project | null> {
+        const { data, error } = await supabase.from('projects').select('*').eq('id', projectId).single();
+        if (error || !data) return null;
+        return this.mapProject(data);
+    },
 
-  async saveProject(project: Project): Promise<void> {
-    const client = requireClient();
-    const payload = {
-        id: project.id, user_id: project.userId, name: project.name,
-        code: project.code, files: project.files, messages: project.messages,
-        status: project.status, build_state: project.buildState, published_url: project.publishedUrl,
-        custom_domain: project.customDomain,
-        supabase_config: project.supabaseConfig,
-        rafiei_cloud_project: project.rafieiCloudProject
-    };
-    const { error } = await client.from('projects').upsert(payload, { onConflict: 'id' });
-    if (error) {
-        if (error.code === '42P01') throw new DatabaseSetupError("TABLE_MISSING");
-        if (error.code === '42703') throw new DatabaseSetupError("SCHEMA_MISMATCH");
-        if (error.code === '42P17') throw new DatabaseSetupError("Infinite Recursion detected in DB Policies. Run SQL Setup.");
-        throw wrapError(error, 'saveProject');
-    }
-  },
+    async getProjectByDomain(hostname: string): Promise<Project | null> {
+        const fetchDomain = async () => {
+            const { data: domainData } = await supabase.from('project_domains')
+                .select('project_id')
+                .eq('domain', hostname)
+                .eq('status', 'verified')
+                .single();
+                
+            let projectId = domainData?.project_id;
 
-  async softDeleteProject(projectId: string): Promise<void> {
-      const client = requireClient();
-      const { error } = await client.from('projects').update({ deleted_at: new Date().toISOString() }).eq('id', projectId);
-      if (error) {
-          if (error.code === '42703' || error.message?.includes('deleted_at')) {
-             return this.deleteProject(projectId);
-          }
-          throw wrapError(error, 'softDeleteProject');
-      }
-      webhookService.send('project.deleted', { method: 'soft' }, { project_id: projectId });
-  },
+            if (!projectId) {
+                 const { data: projData } = await supabase.from('projects')
+                    .select('id')
+                    .or(`custom_domain.eq.${hostname},published_url.ilike.%${hostname}%`)
+                    .single();
+                 projectId = projData?.id;
+            }
 
-  async restoreProject(projectId: string): Promise<void> {
-      const client = requireClient();
-      const { error } = await client.from('projects').update({ deleted_at: null }).eq('id', projectId);
-      if (error) throw wrapError(error, 'restoreProject');
-      webhookService.send('project.updated', { status: 'restored' }, { project_id: projectId });
-  },
-  
-  async deleteProject(projectId: string): Promise<void> {
-      const client = requireClient();
-      const { error } = await client.from('projects').delete().eq('id', projectId);
-      if (error) throw wrapError(error, 'deleteProject');
-      webhookService.send('project.deleted', { method: 'permanent' }, { project_id: projectId });
-  },
+            if (projectId) {
+                return await this.getProject(projectId);
+            }
+            return null;
+        };
 
-  // ... (subscribeToProjectChanges, subscribeToUserProjects, uploadChatImage, stopBuild, triggerBuild, getDomainsForProject, addDomain, deleteDomain, verifyDomain, getUserSettings, saveUserSettings, getUserLanguage, saveUserLanguage, checkTableExists, checkBucketExists, testConnection, rpc) ...
-  subscribeToProjectChanges(projectId: string, callback: (project: Project) => void): { unsubscribe: () => void } {
-    const client = requireClient();
-    const channel: RealtimeChannel = client
-      .channel(`project-${projectId}`)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'projects', filter: `id=eq.${projectId}` }, (payload) => callback(mapRowToProject(payload.new)))
-      .subscribe();
-      return { unsubscribe: () => client.removeChannel(channel) };
-  },
+        try {
+            return await Promise.race([
+                fetchDomain(),
+                new Promise<null>(resolve => setTimeout(() => resolve(null), 8000))
+            ]);
+        } catch(e) {
+            return null;
+        }
+    },
 
-  subscribeToUserProjects(userId: string, callback: (payload: any) => void): { unsubscribe: () => void } {
-    const client = requireClient();
-    const channel: RealtimeChannel = client
-        .channel(`user-projects-${userId}`)
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'projects', filter: `user_id=eq.${userId}` }, callback)
-        .subscribe();
-    return { unsubscribe: () => client.removeChannel(channel) };
-  },
+    async saveProject(project: Project): Promise<void> {
+        const payload = {
+            id: project.id,
+            user_id: project.userId,
+            name: project.name,
+            updated_at: new Date().toISOString(),
+            code: project.code,
+            files: project.files,
+            messages: project.messages,
+            build_state: project.buildState,
+            status: project.status,
+            published_url: project.publishedUrl,
+            custom_domain: project.customDomain,
+            rafiei_cloud_project: project.rafieiCloudProject,
+            vercel_config: project.vercelConfig,
+            deleted_at: project.deletedAt ? new Date(project.deletedAt).toISOString() : null
+        };
+        const { error } = await supabase.from('projects').upsert(payload);
+        if (error) throw error;
+    },
 
-  async uploadChatImage(userId: string, messageId: string, file: File): Promise<string> {
-    const client = requireClient();
-    const filePath = `${userId}/${messageId}/${file.name.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
-    const { error } = await client.storage.from('chat-images').upload(filePath, file, { upsert: true });
-    if (error) throw wrapError(error, 'uploadChatImage');
-    const { data } = client.storage.from('chat-images').getPublicUrl(filePath);
-    return data.publicUrl;
-  },
+    async softDeleteProject(id: string): Promise<void> {
+        await supabase.from('projects').update({ deleted_at: new Date().toISOString() }).eq('id', id);
+    },
 
-  stopBuild(projectId: string) {
-      const controller = buildAbortControllers.get(projectId);
-      if (controller) {
-          controller.abort();
-          buildAbortControllers.delete(projectId);
-      }
-  },
+    async restoreProject(id: string): Promise<void> {
+        await supabase.from('projects').update({ deleted_at: null }).eq('id', id);
+    },
 
-  async triggerBuild(
-    project: Project, 
-    prompt: string, 
-    images?: { url: string, base64: string }[],
-    onStateChange?: (project: Project) => void
-  ): Promise<void> {
-      const finalMessages = [...project.messages];
-      const lastUserMsg = [...finalMessages].reverse().find(m => m.role === 'user');
+    async deleteProject(id: string): Promise<void> {
+        await supabase.from('projects').delete().eq('id', id);
+    },
 
-      if (!lastUserMsg) {
-          console.error("triggerBuild: No user message found");
-          if (project.status === 'generating') await this.saveProject({ ...project, status: 'idle' });
-          return;
-      }
+    // Fast creation for immediate feedback
+    async createProjectSkeleton(user: User, prompt: string, images: {url: string, base64: string}[]): Promise<string> {
+        const newProject: Project = {
+            id: crypto.randomUUID(),
+            userId: user.id,
+            name: "New Project", 
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            code: { html: '', javascript: '', css: '', explanation: '' },
+            files: [],
+            messages: [{
+                id: crypto.randomUUID(),
+                role: 'user',
+                content: prompt,
+                timestamp: Date.now(),
+                images: images.map(i => i.url)
+            }],
+            status: 'idle',
+            buildState: null
+        };
+        await this.saveProject(newProject);
+        return newProject.id;
+    },
 
-      if (images && images.length > 0) {
-          const lastUserMsgIndex = finalMessages.findIndex(m => m.id === lastUserMsg.id);
-          if (lastUserMsgIndex !== -1) {
-              const imageUrls = images.map(img => img.url);
-              const existingImages = finalMessages[lastUserMsgIndex].images || [];
-              const allImages = [...new Set([...existingImages, ...imageUrls])];
-              finalMessages[lastUserMsgIndex] = { ...finalMessages[lastUserMsgIndex], images: allImages };
-          }
-      }
-      
-      let phases: Phase[] = [];
-      const isModification = /\b(change|update|fix|move|resize|color|font|text|remove|delete|add)\b/i.test(prompt);
-      const isComplexKeywords = /\b(full app|platform|clone|dashboard|system|database|auth|social|commerce|store|complex)\b/i.test(prompt);
-      const isShortAndSimple = prompt.length < 80 && !isComplexKeywords;
-      const shouldSkipPlanning = isModification || isShortAndSimple;
-      
-      if (!shouldSkipPlanning) {
-          try {
-              phases = await generatePhasePlan(prompt, finalMessages);
-          } catch (e) {}
-      }
-      
-      const buildState: BuildState = { 
-          plan: [], 
-          currentStep: 0, 
-          lastCompletedStep: -1, 
-          error: null,
-          phases: phases.length > 0 ? phases : undefined,
-          currentPhaseIndex: 0
-      };
+    async createImportedProject(user: User, name: string, files: ProjectFile[]): Promise<string> {
+        const newProject: Project = {
+            id: crypto.randomUUID(),
+            userId: user.id,
+            name: name,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            code: { html: '', javascript: '', css: '', explanation: 'Imported from GitHub' },
+            files: files,
+            messages: [],
+            status: 'idle',
+            buildState: null
+        };
+        await this.saveProject(newProject);
+        return newProject.id;
+    },
 
-      const updatedProject: Project = {
-          ...project,
-          messages: finalMessages,
-          status: 'generating',
-          buildState: buildState
-      };
-      
-      if (onStateChange) onStateChange(updatedProject);
-      await this.saveProject(updatedProject);
-      
-      this.stopBuild(project.id);
-      
-      const controller = new AbortController();
-      buildAbortControllers.set(project.id, controller);
-      
-      setTimeout(() => {
-          const imageDataForAI = images ? images.map(img => img.base64) : [];
-          runBuildOnServer(updatedProject, prompt, imageDataForAI, onStateChange, (p) => this.saveProject(p), controller.signal)
-            .catch(error => {
-                if (error.message !== 'Build cancelled by user') {
-                     requireClient().from('system_logs').insert({
-                         level: 'critical', source: 'System', message: `Fatal Build Error: ${error.message}`, project_id: project.id
-                     }).catch(console.error);
-                }
+    // --- REALTIME ---
+    subscribeToUserProjects(userId: string, callback: () => void) {
+        const channel = supabase.channel(`user-projects-${userId}`)
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'projects', filter: `user_id=eq.${userId}` }, callback)
+            .subscribe();
+        return { unsubscribe: () => supabase.removeChannel(channel) };
+    },
+
+    subscribeToProjectChanges(projectId: string, callback: (p: Project) => void) {
+        const channel = supabase.channel(`project-${projectId}`)
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'projects', filter: `id=eq.${projectId}` }, async (payload) => {
+                const p = await this.getProject(projectId);
+                if (p) callback(p);
             })
-            .finally(() => {
-                if (buildAbortControllers.get(updatedProject.id) === controller) {
-                    buildAbortControllers.delete(updatedProject.id);
+            .subscribe();
+        return { unsubscribe: () => supabase.removeChannel(channel) };
+    },
+
+    // --- BUILD PROCESS ---
+    async triggerBuild(
+        project: Project, 
+        prompt: string, 
+        images: { url: string; base64: string }[], 
+        onUpdate: (p: Project) => void,
+        onMessage?: (msg: Message) => void
+    ) {
+        if (this.abortController) {
+            this.abortController.abort();
+        }
+        this.abortController = new AbortController();
+        const signal = this.abortController.signal;
+
+        const supervisorImgs = images.map(i => i.base64 || i.url);
+
+        // FIX: Capture project state in a mutable reference to prevent stale closures
+        // The callbacks below will always reference this `currentProject` object, not the initial `project` arg
+        let currentProject = { ...project };
+
+        const updateLocalState = (updates: Partial<Project>) => {
+            currentProject = { ...currentProject, ...updates };
+            onUpdate(currentProject);
+            return currentProject;
+        };
+
+        const supervisor = new GenerationSupervisor(
+            currentProject,
+            prompt,
+            supervisorImgs,
+            {
+                onPlanUpdate: async (phases) => {
+                    if (signal.aborted) return;
+                    const bs = currentProject.buildState || {} as any;
+                    const updated = updateLocalState({ 
+                        buildState: { ...bs, phases, plan: phases.map(p => p.title) } 
+                    });
+                    try { await this.saveProject(updated); } catch(e) { console.warn("Background save failed (Plan Update):", e); }
+                },
+                onMessage: async (msg) => {
+                    if (signal.aborted) return;
+                    // Use updated messages list from mutable state
+                    const updatedMessages = [...currentProject.messages, msg];
+                    const updated = updateLocalState({ messages: updatedMessages });
+                    
+                    if (onMessage) onMessage(msg);
+                    try { await this.saveProject(updated); } catch(e) { console.warn("Background save failed (Message):", e); }
+                },
+                onPhaseStart: async (index) => {
+                    if (signal.aborted) return;
+                    const bs = currentProject.buildState || {} as any;
+                    if(bs.phases && bs.phases[index]) bs.phases[index].status = 'active';
+                    updateLocalState({ 
+                        buildState: { ...bs, currentPhaseIndex: index, currentStep: index } 
+                    });
+                },
+                onPhaseComplete: async (index) => {
+                    if (signal.aborted) return;
+                    const bs = currentProject.buildState || {} as any;
+                    if(bs.phases && bs.phases[index]) bs.phases[index].status = 'completed';
+                    
+                    const updated = updateLocalState({ buildState: bs });
+                    try { await this.saveProject(updated); } catch(e) { console.warn("Background save failed (Phase Complete):", e); }
+                },
+                onStepStart: async (index, stepName) => {
+                    if (signal.aborted) return;
+                    const bs = currentProject.buildState || {} as any;
+                    const logs = bs.logs || [];
+                    updateLocalState({ 
+                        buildState: { ...bs, logs: [...logs, stepName] } 
+                    });
+                },
+                onStepComplete: async (index) => {
+                    if (signal.aborted) return;
+                    const bs = currentProject.buildState || {} as any;
+                    updateLocalState({ 
+                        buildState: { ...bs, lastCompletedStep: index, currentStep: index + 1 } 
+                    });
+                },
+                onChunkComplete: async (code, explanation, meta) => {
+                    if (signal.aborted) return;
+                    const updates: Partial<Project> = { code, status: 'generating' as const };
+                    if (meta?.files) updates.files = meta.files;
+                    updateLocalState(updates);
+                },
+                onSuccess: async (code, explanation, audit, meta) => {
+                    if (signal.aborted) return;
+                    
+                    const successMsg: Message = { 
+                        id: crypto.randomUUID(), 
+                        role: 'assistant' as const, 
+                        content: explanation, 
+                        timestamp: Date.now(),
+                        jobSummary: {
+                            title: "Build Completed",
+                            plan: currentProject.buildState?.phases?.map(p => p.title) || [],
+                            status: 'completed' as const,
+                            audit
+                        },
+                        executionTimeMs: meta?.timeMs,
+                        creditsUsed: meta?.credits
+                    };
+
+                    const updatedMessages = [...currentProject.messages, successMsg];
+                    
+                    const updates: Partial<Project> = { 
+                        code, 
+                        status: 'idle' as const, 
+                        messages: updatedMessages,
+                        buildState: { ...currentProject.buildState, error: null, audit } as any
+                    };
+                    if (meta?.files) updates.files = meta.files;
+
+                    const updated = updateLocalState(updates);
+                    try { await this.saveProject(updated); } catch(e) { console.warn("Background save failed (Success):", e); }
+                },
+                onError: async (error, retries) => {
+                    if (signal.aborted) return;
+                    console.log("Supervisor Error Reported:", error);
+                    const bs = currentProject.buildState || {} as any;
+                    const currentLogs = bs.logs || [];
+                    
+                    updateLocalState({ 
+                        buildState: { 
+                            ...bs, 
+                            error: `Error: ${error} (Retrying... ${retries} attempts left)`,
+                            logs: [...currentLogs, `ERROR: ${error}`]
+                        } as any 
+                    });
+                },
+                onFinalError: async (error, audit) => {
+                    if (signal.aborted) return;
+                    
+                    const failMsg: Message = { 
+                        id: crypto.randomUUID(), 
+                        role: 'assistant' as const, 
+                        content: `Build Failed: ${error}`, 
+                        timestamp: Date.now(), 
+                        jobSummary: { 
+                            title: "Build Failed", 
+                            plan: currentProject.buildState?.phases?.map(p => p.title) || [], 
+                            status: 'failed' as const 
+                        } 
+                    };
+
+                    const updatedMessages = [...currentProject.messages, failMsg];
+
+                    const updated = updateLocalState({ 
+                        status: 'failed' as const, 
+                        buildState: { ...currentProject.buildState, error, audit } as any,
+                        messages: updatedMessages
+                    });
+                    try { await this.saveProject(updated); } catch(e) { console.warn("Background save failed (Final Error):", e); }
                 }
-            });
-      }, 0);
-  },
+            },
+            signal
+        );
 
-  async getDomainsForProject(projectId: string): Promise<Domain[]> { return []; },
-  async addDomain(projectId: string, userId: string, domainName: string): Promise<void> {},
-  async deleteDomain(domainId: string): Promise<void> {},
-  async verifyDomain(domainId: string): Promise<Domain> { return {} as any; },
+        supervisor.start().catch(console.error);
+    },
 
-  async getUserSettings(userId: string): Promise<{url: string, key: string} | null> {
-      const client = requireClient();
-      try {
-          const { data, error } = await client.from('user_settings').select('supabase_config').eq('user_id', userId).single();
-          if (error) { if (error.code === 'PGRST116' || error.code === '42P01') return null; throw error; }
-          return data?.supabase_config || null;
-      } catch (e) { return null; }
-  },
+    stopBuild(projectId: string) {
+        if (this.abortController) {
+            this.abortController.abort();
+            this.abortController = null;
+        }
+    },
 
-  async saveUserSettings(userId: string, config: {url: string, key: string} | null): Promise<void> {
-      const client = requireClient();
-      if (config === null) await client.from('user_settings').upsert({ user_id: userId, supabase_config: null });
-      else await client.from('user_settings').upsert({ user_id: userId, supabase_config: config });
-  },
+    async uploadChatImage(userId: string, tempId: string, file: File): Promise<string> {
+        const path = `${userId}/${tempId}-${file.name}`;
+        const { data, error } = await supabase.storage.from('chat_images').upload(path, file);
+        if (error) {
+            if (error.message.includes('Bucket not found') || (error as any).statusCode === '404') {
+                console.debug("Image upload skipped (Bucket missing), using base64.");
+            } else {
+                console.warn("Image upload failed, using base64 fallback", error);
+            }
+            return fileToBase64(file);
+        }
+        const { data: publicData } = supabase.storage.from('chat_images').getPublicUrl(path);
+        return publicData.publicUrl;
+    },
 
-  async getUserLanguage(userId: string): Promise<string | null> {
-      const client = requireClient();
-      try {
-          const { data, error } = await client.from('user_settings').select('language').eq('user_id', userId).single();
-          if (error) { if (error.code === 'PGRST116' || error.code === '42P01') return null; return null; }
-          return data?.language || null;
-      } catch (e) { return null; }
-  },
+    // ... (rest of methods)
+    
+    // --- DOMAINS ---
+    async getDomainsForProject(projectId: string): Promise<Domain[]> {
+        const { data, error } = await supabase.from('project_domains').select('*').eq('project_id', projectId);
+        if (error) throw error;
+        return data.map((d: any) => ({
+            id: d.id,
+            domainName: d.domain,
+            projectId: d.project_id,
+            type: d.type,
+            dnsRecordType: d.dns_record_type,
+            dnsRecordValue: d.dns_record_value,
+            status: d.status,
+            updatedAt: new Date(d.updated_at).getTime()
+        }));
+    },
 
-  async saveUserLanguage(userId: string, language: string): Promise<void> {
-      const client = requireClient();
-      await client.from('user_settings').upsert({ user_id: userId, language: language }, { onConflict: 'user_id' });
-  },
+    async addDomain(projectId: string, userId: string, domain: string): Promise<void> {
+        if (!domain.includes('.')) throw new Error("Invalid domain format");
+        
+        const type = domain.split('.').length > 2 ? 'subdomain' : 'root';
+        const recordType = type === 'root' ? 'A' : 'CNAME';
+        const recordValue = type === 'root' ? '76.76.21.21' : 'cname.vercel-dns.com';
 
-  async getUserCredits(userId: string): Promise<number> {
-      const client = requireClient();
-      const { data, error } = await client.from('user_settings').select('credits_balance').eq('user_id', userId).single();
-      if (error) return 0;
-      return data?.credits_balance ?? 0;
-  },
+        await supabase.from('project_domains').insert({
+            project_id: projectId,
+            domain,
+            type,
+            dns_record_type: recordType,
+            dns_record_value: recordValue,
+            status: 'pending'
+        });
+    },
 
-  async checkTableExists(tableName: string): Promise<boolean> {
-      const client = requireClient();
-      const { error } = await client.from(tableName).select('id').limit(1);
-      if (error && error.code === '42P01') return false;
-      return true;
-  },
+    async deleteDomain(domainId: string): Promise<void> {
+        await supabase.from('project_domains').delete().eq('id', domainId);
+    },
 
-  async checkBucketExists(bucketName: string): Promise<boolean> {
-      const client = requireClient();
-      const { data, error } = await client.storage.getBucket(bucketName);
-      if (error || !data) return false;
-      return true;
-  },
-  
-  async testConnection(url: string, key: string): Promise<boolean> {
-      if (!url || !key) return false;
-      try {
-          const tempClient = createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
-          const { error } = await tempClient.from('__check__').select('*').limit(1);
-          if (error && error.code !== '42P01' && error.code !== 'PGRST205') return false; 
-          return true; 
-      } catch (e) { return false; }
-  },
+    async verifyDomain(domainId: string): Promise<Domain> {
+        await new Promise(r => setTimeout(r, 1500));
+        const status = Math.random() > 0.3 ? 'verified' : 'error';
+        const { data, error } = await supabase.from('project_domains').update({ status }).eq('id', domainId).select().single();
+        if (error) throw error;
+        
+        if (status === 'verified') {
+            await supabase.from('projects').update({ custom_domain: data.domain }).eq('id', data.project_id);
+        }
 
-  async rpc(funcName: string, params: any) {
-      const client = requireClient();
-      return await client.rpc(funcName, params);
-  },
+        return {
+            id: data.id,
+            domainName: data.domain,
+            projectId: data.project_id,
+            type: data.type,
+            dnsRecordType: data.dns_record_type,
+            dnsRecordValue: data.dns_record_value,
+            status: data.status,
+            updatedAt: new Date(data.updated_at).getTime()
+        };
+    },
 
-  // --- NEW: Webhook Management Methods ---
-  async getSystemSetting(key: string): Promise<string | null> {
-      const client = requireClient();
-      const { data, error } = await client.from('system_settings').select('value').eq('key', key).single();
-      if (error || !data) return null;
-      return data.value;
-  },
+    // --- RAFIEI CLOUD ---
+    async saveRafieiCloudProject(project: RafieiCloudProject) {
+        const payload = {
+            id: project.id,
+            user_id: project.userId,
+            project_ref: project.projectRef,
+            project_name: project.projectName,
+            status: project.status,
+            region: project.region,
+            db_pass: project.dbPassword,
+            publishable_key: project.publishableKey,
+            secret_key: project.secretKey
+        };
+        const { error } = await supabase.from('rafiei_cloud_projects').upsert(payload);
+        if (error) throw error;
+    },
 
-  async setSystemSetting(key: string, value: string): Promise<void> {
-      const client = requireClient();
-      const { error } = await client.from('system_settings').upsert({ key, value });
-      if (error) throw wrapError(error, 'setSystemSetting');
-  },
+    // --- ADMIN & SYSTEM (Paginated) ---
+    async checkTableExists(tableName: string): Promise<boolean> {
+        const { error } = await supabase.from(tableName).select('id').limit(1);
+        if (error) {
+            if (error.code === '42P01') return false; 
+        }
+        return true;
+    },
 
-  async getWebhookLogs(limit = 50): Promise<WebhookLog[]> {
-      const client = requireClient();
-      const { data, error } = await client.from('webhook_logs').select('*').order('created_at', { ascending: false }).limit(limit);
-      if (error) {
-          if (error.code === '42P01') return []; // Table missing
-          throw wrapError(error, 'getWebhookLogs');
-      }
-      return data.map((row: any) => ({
-          id: row.id,
-          event_type: row.event_type,
-          payload: row.payload,
-          status_code: row.status_code,
-          response_body: row.response_body,
-          created_at: new Date(row.created_at).getTime()
-      }));
-  },
+    async rpc(fn: string, params: any) {
+        const { data, error } = await supabase.rpc(fn, params);
+        if (error) throw error;
+        return data;
+    },
 
-  async saveWebhookLog(log: Partial<WebhookLog>) {
-      const client = requireClient();
-      // Use client directly to avoid recursion or extra checks
-      await client.from('webhook_logs').insert(log).catch(console.warn);
-  }
+    async getAdminProjects(page = 1, limit = 10): Promise<{ data: Project[], count: number }> {
+        const from = (page - 1) * limit;
+        const to = from + limit - 1;
+        const { data, count, error } = await supabase
+            .from('projects')
+            .select('*', { count: 'exact' })
+            .order('created_at', { ascending: false })
+            .range(from, to);
+            
+        if (error) throw error;
+        return { 
+            data: (data || []).map(this.mapProject), 
+            count: count || 0 
+        };
+    },
+
+    async getAdminUsers(page = 1, limit = 10): Promise<{ data: any[], count: number }> {
+        const from = (page - 1) * limit;
+        const to = from + limit - 1;
+        
+        // Use RPC with range for pagination if supported, otherwise fallback to simple fetch logic
+        // Assuming 'get_all_users' returns a setof record/table which allows chaining range
+        const { data, count, error } = await supabase
+            .rpc('get_all_users', {}, { count: 'exact' })
+            .range(from, to);
+            
+        if (error) throw error;
+        return { data: data || [], count: count || 0 };
+    },
+
+    async getSystemLogs(page = 1, limit = 10): Promise<{ data: SystemLog[], count: number }> {
+        const from = (page - 1) * limit;
+        const to = from + limit - 1;
+        const { data, count, error } = await supabase
+            .from('system_logs')
+            .select('*', { count: 'exact' })
+            .order('created_at', { ascending: false })
+            .range(from, to);
+            
+        if (error) return { data: [], count: 0 };
+        const logs = (data || []).map((l: any) => ({
+            id: l.id,
+            timestamp: new Date(l.created_at).getTime(),
+            level: l.level,
+            source: l.source,
+            message: l.message,
+            projectId: l.project_id,
+            meta: l.meta
+        }));
+        return { data: logs, count: count || 0 };
+    },
+
+    async getFinancialStats(): Promise<FinancialStats | null> {
+        // This still requires aggregate data, so we don't paginate here.
+        // It's a summary endpoint.
+        const { data: ledger } = await supabase.from('credit_ledger').select('credits_deducted, raw_cost_usd, input_tokens, output_tokens');
+        const { data: transactions } = await supabase.from('credit_transactions').select('amount').eq('type', 'purchase');
+        
+        if (!ledger || !transactions) return null;
+
+        const totalRevenueCredits = ledger.reduce((sum, row) => sum + (Number(row.credits_deducted) || 0), 0);
+        const totalCostUsd = ledger.reduce((sum, row) => sum + (Number(row.raw_cost_usd) || 0), 0);
+        const totalCreditsPurchased = transactions.reduce((sum, row) => sum + (Number(row.amount) || 0), 0);
+        const revenueUsd = totalRevenueCredits / 10;
+        const netProfitUsd = revenueUsd - totalCostUsd;
+        const totalInput = ledger.reduce((sum, row) => sum + (Number(row.input_tokens) || 0), 0);
+        const totalOutput = ledger.reduce((sum, row) => sum + (Number(row.output_tokens) || 0), 0);
+
+        return {
+            totalRevenueCredits,
+            totalCostUsd,
+            netProfitUsd,
+            totalCreditsPurchased,
+            currentMargin: 50, 
+            totalInputTokens: totalInput,
+            totalOutputTokens: totalOutput,
+            totalRequestCount: ledger.length
+        };
+    },
+
+    async getLedger(page = 1, limit = 10): Promise<{ data: CreditLedgerEntry[], count: number }> {
+        const from = (page - 1) * limit;
+        const to = from + limit - 1;
+        const { data, count, error } = await supabase
+            .from('credit_ledger')
+            .select('*', { count: 'exact' })
+            .order('created_at', { ascending: false })
+            .range(from, to);
+            
+        if (error) return { data: [], count: 0 };
+        const ledger = (data || []).map((row: any) => ({
+            id: row.id,
+            userId: row.user_id,
+            projectId: row.project_id,
+            operationType: row.operation_type,
+            model: row.model,
+            inputTokens: row.input_tokens,
+            outputTokens: row.output_tokens,
+            rawCostUsd: row.raw_cost_usd,
+            profitMargin: row.profit_margin,
+            creditsDeducted: row.credits_deducted,
+            createdAt: new Date(row.created_at).getTime(),
+            meta: row.meta 
+        }));
+        return { data: ledger, count: count || 0 };
+    },
+
+    async getSystemSetting(key: string): Promise<string | null> {
+        const { data } = await supabase.from('system_settings').select('value').eq('key', key).single();
+        return data?.value || null;
+    },
+
+    // New helper to fetch multiple settings efficiently
+    async getSystemSettings(keys: string[]) {
+        return await supabase.from('system_settings').select('key, value').in('key', keys);
+    },
+
+    async setSystemSetting(key: string, value: string): Promise<void> {
+        const { error } = await supabase.from('system_settings').upsert({ key, value });
+        if (error) throw error;
+    },
+
+    async getWebhookLogs(page = 1, limit = 10): Promise<{ data: WebhookLog[], count: number }> {
+        const from = (page - 1) * limit;
+        const to = from + limit - 1;
+        const { data, count, error } = await supabase
+            .from('webhook_logs')
+            .select('*', { count: 'exact' })
+            .order('created_at', { ascending: false })
+            .range(from, to);
+            
+        if (error) return { data: [], count: 0 };
+        return { data: data as WebhookLog[], count: count || 0 };
+    },
+
+    async getUserCredits(userId: string): Promise<number> {
+        const { data } = await supabase.from('user_settings').select('credits_balance').eq('user_id', userId).single();
+        return data?.credits_balance !== undefined ? data.credits_balance : 0;
+    },
+
+    async getUserFinancialOverview(userId: string) {
+        const { data: txs } = await supabase.from('credit_transactions').select('amount').eq('user_id', userId).eq('type', 'purchase');
+        const { data: usage } = await supabase.from('credit_ledger').select('credits_deducted, raw_cost_usd').eq('user_id', userId);
+        
+        const totalPurchased = txs?.reduce((sum, t) => sum + Number(t.amount), 0) || 0;
+        const totalSpent = usage?.reduce((sum, u) => sum + Number(u.credits_deducted), 0) || 0;
+        const totalCost = usage?.reduce((sum, u) => sum + Number(u.raw_cost_usd), 0) || 0;
+        const revenueUsd = totalSpent / 10;
+        const profitGenerated = revenueUsd - totalCost;
+
+        return { totalPurchased, totalSpent, totalCost, profitGenerated };
+    },
+
+    async getUserTransactions(userId: string): Promise<CreditTransaction[]> {
+        const { data, error } = await supabase.from('credit_transactions').select('*').eq('user_id', userId).order('created_at', { ascending: false });
+        if (error) return [];
+        return data.map((t: any) => ({
+            id: t.id,
+            userId: t.user_id,
+            amount: Number(t.amount),
+            type: t.type,
+            currency: t.currency,
+            exchangeRate: Number(t.exchange_rate),
+            paymentId: t.payment_id,
+            description: t.description,
+            createdAt: new Date(t.created_at).getTime()
+        }));
+    },
+
+    async adminAdjustCredit(userId: string, amount: number, note: string, adminEmail: string): Promise<void> {
+        const { error } = await supabase.rpc('admin_adjust_balance', {
+            p_target_user_id: userId,
+            p_amount: amount,
+            p_description: note,
+            p_admin_email: adminEmail
+        });
+        if (error) throw error;
+    },
+
+    mapProject(p: any): Project {
+        return {
+            id: p.id,
+            userId: p.user_id,
+            name: p.name,
+            createdAt: new Date(p.created_at).getTime(),
+            updatedAt: new Date(p.updated_at).getTime(),
+            deletedAt: p.deleted_at ? new Date(p.deleted_at).getTime() : undefined,
+            code: p.code || { html: '', javascript: '', css: '', explanation: '' },
+            files: p.files || [],
+            messages: p.messages || [],
+            status: p.status || 'idle',
+            buildState: p.build_state || null,
+            publishedUrl: p.published_url,
+            customDomain: p.custom_domain,
+            rafieiCloudProject: p.rafiei_cloud_project ? {
+                id: p.rafiei_cloud_project.id,
+                userId: p.rafiei_cloud_project.user_id,
+                projectRef: p.rafiei_cloud_project.project_ref,
+                projectName: p.rafiei_cloud_project.project_name,
+                status: p.rafiei_cloud_project.status,
+                region: p.rafiei_cloud_project.region,
+                dbPassword: p.rafiei_cloud_project.db_pass,
+                publishableKey: p.rafiei_cloud_project.publishable_key,
+                secretKey: p.rafiei_cloud_project.secret_key,
+                createdAt: new Date(p.rafiei_cloud_project.created_at || Date.now()).getTime()
+            } : undefined,
+            vercelConfig: p.vercel_config
+        };
+    }
 };

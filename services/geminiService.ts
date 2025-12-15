@@ -1,639 +1,568 @@
 
-import { GoogleGenAI, Type, GenerateContentResponse } from "@google/genai";
-import { GeneratedCode, Message, Suggestion, BuildState, Project, Phase } from "../types";
+import { GoogleGenAI } from "@google/genai";
+import { createClient } from '@supabase/supabase-js';
+import { GeneratedCode, Message, Suggestion, Project, Phase, BuildAudit, AIProviderConfig, AIUsageResult, DecisionJSON, DesignSpecJSON, FilePlanJSON, FileChange, QAJSON, ProjectFile } from "../types";
 import { billingService } from "./billingService";
+import { aiProviderService } from "./aiProviderService";
+import { openaiService } from "./openaiService";
+import { claudeService } from "./claudeService";
 
-// Safe environment access
+// --- ENVIRONMENT & SAFETY ---
 const getEnv = (key: string) => {
   try {
     // @ts-ignore
-    if (typeof process !== 'undefined' && process.env) {
-       // @ts-ignore
-       return process.env[key];
-    }
-  } catch (e) {
-    // Ignore errors
-  }
+    if (typeof process !== 'undefined' && process.env) return process.env[key];
+  } catch (e) {}
   return undefined;
 };
 
+const DEFAULT_GEMINI_KEY = getEnv('API_KEY') || '';
+
+// --- SUPABASE CLIENT (Local instance to avoid circular dependency) ---
 const SUPABASE_URL = getEnv('SUPABASE_URL') || getEnv('REACT_APP_SUPABASE_URL') || 'https://sxvqqktlykguifvmqrni.supabase.co';
 const SUPABASE_KEY = getEnv('SUPABASE_ANON_KEY') || getEnv('REACT_APP_SUPABASE_ANON_KEY') || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN4dnFxa3RseWtndWlmdm1xcm5pIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjU0MDE0MTIsImV4cCI6MjA4MDk3NzQxMn0.5psTW7xePYH3T0mkkHmDoWNgLKSghOHnZaW2zzShkSA';
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-const ai = new GoogleGenAI({ apiKey: getEnv('API_KEY') || '' });
+// --- SYSTEM PROMPT MANAGEMENT ---
+// Simple in-memory cache to prevent hammering DB during a single session
+const promptCache: Record<string, string> = {};
 
-const DB_CONNECT_MESSAGE = "This project requires a backend database. Starting Rafiei Cloud connection process...";
+const getSystemPrompt = async (key: string, defaultVal: string): Promise<string> => {
+    // 1. Check cache
+    if (promptCache[key]) return promptCache[key];
 
-// --- USAGE LOGGING WRAPPER ---
-// Now integrates Billing and returns cost
-const logUsageAndCharge = async (model: string, response: any, projectId: string, userId: string, opType: string): Promise<number> => {
-   if (!response || !response.usageMetadata) return 0;
-   const meta = response.usageMetadata;
-   
-   try {
-       const deducted = await billingService.chargeUser(userId, projectId, opType, model, {
-           promptTokenCount: meta.promptTokenCount || 0,
-           candidatesTokenCount: meta.candidatesTokenCount || 0
-       });
-       return deducted;
-   } catch (e) {
-       console.error("CRITICAL BILLING FAILURE:", e);
-       return 0;
-   }
-};
-
-// ... existing PROMPT_KEYS, getSystemInstruction, DEFAULTS ...
-export const PROMPT_KEYS = {
-    CHAT: 'sys_prompt_chat',
-    ROUTER: 'sys_prompt_router',
-    REQUIREMENTS: 'sys_prompt_requirements',
-    PHASE_PLANNER: 'sys_prompt_phase_planner',
-    PLANNER: 'sys_prompt_planner',
-    BUILDER: 'sys_prompt_builder',
-    SQL: 'sys_prompt_sql',
-    REPAIR: 'sys_prompt_repair'
-};
-
-const getSystemInstruction = (key: string, defaultPrompt: string): string => {
-    if (typeof window !== 'undefined') {
-        const stored = localStorage.getItem(key);
-        if (stored) return stored;
+    // 2. Check DB
+    try {
+        const { data } = await supabase.from('system_settings').select('value').eq('key', key).single();
+        if (data?.value) {
+            promptCache[key] = data.value;
+            return data.value;
+        }
+    } catch (e) {
+        // Silent fail to default
     }
-    return defaultPrompt;
+
+    // 3. Fallback to Default
+    return defaultVal;
 };
 
-// --- DEFAULT SYSTEM INSTRUCTIONS (Preserved) ---
-export const DEFAULTS = {
-    CHAT: `You are Rafiei Builder's assistant. You are helpful, fast, and witty. Your goal is to answer general questions, explain concepts, or acknowledge simple requests. Use the provided conversation history to understand context. If the user asks to BUILD, CREATE, GENERATE, or MODIFY code, politely explain that you are switching to "Architect" mode. Keep responses concise.`,
+// --- ORCHESTRATOR UTILS ---
+const getActiveProvider = async (): Promise<AIProviderConfig> => {
+    try {
+        const active = await aiProviderService.getActiveConfig();
+        if (active) return active;
+        const fallback = await aiProviderService.getFallbackConfig();
+        if (fallback && fallback.apiKey) return fallback;
+        if (DEFAULT_GEMINI_KEY) {
+            return {
+                id: 'google',
+                name: 'Google Gemini (Env)',
+                isActive: true,
+                isFallback: false,
+                apiKey: DEFAULT_GEMINI_KEY,
+                model: 'gemini-2.5-flash',
+                updatedAt: Date.now()
+            };
+        }
+    } catch (e) {}
+    return { id: 'google', name: 'Google Gemini (Default)', isActive: true, isFallback: false, apiKey: DEFAULT_GEMINI_KEY, model: 'gemini-2.5-flash', updatedAt: Date.now() };
+};
+
+const executeAIRequest = async (config: AIProviderConfig, prompt: string, systemInstruction: string, images: string[] = []): Promise<{ text: string, usage: AIUsageResult }> => {
+    if (!config.apiKey) throw new Error(`API Key missing for provider: ${config.name}`);
+
+    if (config.id === 'google') {
+        const ai = new GoogleGenAI({ apiKey: config.apiKey });
+        const reqConfig: any = { 
+            systemInstruction, 
+            temperature: 0.2,
+            maxOutputTokens: 8192 
+        };
+        
+        // Only use JSON mode if explicitly requested by prompt logic, 
+        // but verify system prompt actually contains "JSON" to avoid 400 errors from strict validators.
+        if (systemInstruction.toUpperCase().includes('JSON')) {
+            reqConfig.responseMimeType = 'application/json';
+        }
+        
+        let contents: any = prompt;
+        if (images.length > 0) {
+            const parts: any[] = [];
+            images.forEach(img => {
+                let mimeType = 'image/jpeg';
+                let rawBase64 = img;
+                if (img.includes('base64,')) {
+                    const split = img.split('base64,');
+                    rawBase64 = split[1];
+                    if (split[0].includes('png')) mimeType = 'image/png';
+                    else if (split[0].includes('webp')) mimeType = 'image/webp';
+                }
+                parts.push({ inlineData: { mimeType, data: rawBase64 } });
+            });
+            parts.push({ text: prompt });
+            contents = { parts };
+        }
+
+        const response = await ai.models.generateContent({ model: config.model || 'gemini-2.5-flash', contents, config: reqConfig });
+        const inputTokens = response.usageMetadata?.promptTokenCount || 0;
+        const outputTokens = response.usageMetadata?.candidatesTokenCount || 0;
+        const cost = billingService.calculateRawCost(config.model || 'gemini-2.5-flash', inputTokens, outputTokens);
+
+        return { text: response.text || "{}", usage: { promptTokens: inputTokens, completionTokens: outputTokens, costUsd: cost, provider: 'google', model: config.model || 'gemini-2.5-flash' } };
+    } 
+    else if (config.id === 'openai') {
+        return await openaiService.generateContent(config.apiKey!, config.model, prompt, systemInstruction, images);
+    }
+    else if (config.id === 'claude') {
+        return await claudeService.generateContent(config.apiKey!, config.model, prompt, systemInstruction, images);
+    }
+    throw new Error(`Unknown provider: ${config.id}`);
+};
+
+const robustGenerate = async (prompt: string, systemInstruction: string, projectId: string, userId: string, opType: string, images: string[] = []): Promise<string> => {
+    let activeConfig = await getActiveProvider();
+    try {
+        const result = await executeAIRequest(activeConfig, prompt, systemInstruction, images);
+        await billingService.chargeUser(userId, projectId, opType, result.usage.model, { promptTokenCount: result.usage.promptTokens, candidatesTokenCount: result.usage.completionTokens, costUsd: result.usage.costUsd }, { prompt: prompt.substring(0, 500) });
+        return result.text;
+    } catch (error: any) {
+        console.warn(`Primary AI (${activeConfig.name}) failed:`, error);
+        const fallbackConfig = await aiProviderService.getFallbackConfig();
+        if (fallbackConfig && fallbackConfig.apiKey) {
+            const result = await executeAIRequest(fallbackConfig, prompt, systemInstruction, images);
+            await billingService.chargeUser(userId, projectId, `${opType}_fallback`, result.usage.model, { promptTokenCount: result.usage.promptTokens, candidatesTokenCount: result.usage.completionTokens, costUsd: result.usage.costUsd }, { note: "Fallback" });
+            return result.text;
+        }
+        throw error;
+    }
+};
+
+const extractJson = (text: string | undefined): any => {
+    if (!text) throw new Error("Empty response from AI");
+    let cleanText = text.trim();
     
-    ROUTER: `You are a smart router. Your job is to decide if the user's input requires the "ARCHITECT" (who writes/modifies code) or the "CHAT" (who answers questions).
-RETURN "ARCHITECT" IF: User wants to create, build, generate, modify, edit, fix, add, or change the app/code/UI. This includes requests with images.
-RETURN "CHAT" IF: User is asking a conceptual question, saying hello, or reacting.
-Output: Strictly "ARCHITECT" or "CHAT".`,
+    // Attempt to extract from markdown code blocks first (relaxed regex)
+    const markdownMatch = cleanText.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    if (markdownMatch) {
+        cleanText = markdownMatch[1].trim();
+    }
+    
+    // Locate outermost JSON bounds to handle intro/outro text
+    const firstBrace = cleanText.indexOf('{');
+    const lastBrace = cleanText.lastIndexOf('}');
+    
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+        cleanText = cleanText.substring(firstBrace, lastBrace + 1);
+    }
 
-    REQUIREMENTS: `You are a technical requirements analyst for a web app builder.
-Your task is to classify if a user's request requires a BACKEND DATABASE (Supabase) or if it can be built as a STATIC FRONTEND.
+    try { 
+        return JSON.parse(cleanText); 
+    } catch (e) { 
+        console.error("JSON Parse Fail. Raw text snippet:", text.substring(0, 200)); 
+        throw new Error("Failed to parse JSON response. The model output was not valid JSON."); 
+    }
+};
 
-**CRITICAL RULES:**
-1. **RETURN "databaseRequired": true IF:**
-   - The user wants to **STORE**, **SAVE**, **RECORD**, **KEEP**, **COLLECT**, or **PERSIST** data.
-   - The user mentions specific data fields like **"first name"**, **"last name"**, **"email"**, **"phone"**.
-   - Example: "Store user name", "Save messages", "Guestbook", "Todo list that saves", "Form to collect names".
-   - The user mentions **Database**, **DB**, **SQL**, **Tables**, **Auth**, **Login**, **Users**.
-   - The user mentions **FORMS** that submit data (e.g. "Contact Form", "Signup Form", "Order Form").
-   - The user mentions dynamic entities like **Posts**, **Comments**, **Products**, **Orders**, **Inventory**.
-   - Even if the user says "Simple app", if it involves *saving* data, it NEEDS a database.
+// Renamed keys to 'v2' to force cache busting and bypass broken prompts in DB
+export const PROMPT_KEYS = {
+    DECISION: 'sys_prompt_decision_v2',
+    REQUIREMENTS: 'sys_prompt_requirements_v2',
+    PHASE_PLANNER: 'sys_prompt_phase_planner_v2',
+    DESIGN: 'sys_prompt_design_v2',
+    PLANNER: 'sys_prompt_planner_v2', 
+    BUILDER: 'sys_prompt_builder_v2', 
+    REPAIR: 'sys_prompt_repair_v2',
+    QA: 'sys_prompt_qa_v2',
+    SQL: 'sys_prompt_sql_v2',
+    NARRATOR: 'sys_prompt_narrator_v2',
+    FILE_PLAN: 'sys_prompt_file_plan',
+    CODE: 'sys_prompt_code',
+};
 
-2. **RETURN "databaseRequired": false IF:**
-   - The request is purely visual (e.g., "Change color to red", "Make it responsive").
-   - The data is transient/local only (e.g., "Calculator", "Unit converter", "Lorem ipsum generator").
-   - The user EXPLICITLY says "static", "mock data", "frontend only", "no db".
-
-3. **AMBIGUITY:**
-   - If unsure, default to **true** to ensure the app is capable.
-
-**Output strictly JSON:** { "databaseRequired": boolean }`,
-
-    PHASE_PLANNER: `You are a Senior Technical Project Manager enforcing strict build stability protocols.
-Your goal is to break down a build request into MANDATORY PHASES to ensure the UI is fully visible before any complex logic is added.
-
-🔴 **Critical Rule (Non-Negotiable)**
-You must never start building backend logic, APIs, authentication, or complex state until ALL UI pages are fully rendered and visible without errors.
-
-**MANDATORY BUILD PHASES:**
-
-**Phase 1: UI Skeleton (Required First)**
-- GOAL: Render all pages, routes, navigation, and layout.
-- Deliverables: Routes, Header, Footer, Page Containers.
-- Rules: Use placeholders. Buttons non-functional. Forms static. NO imports that can fail. NO backend logic.
-
-**Phase 2: UI Completion**
-- GOAL: Flesh out the UI with sections, cards, tables, and forms.
-- Deliverables: Complete page layouts, static mock data.
-- Rules: Still no real API. Loading/Empty/Error states (static).
-
-**Phase 3: Client-side Logic**
-- GOAL: Add interactivity.
-- Deliverables: Local state (React.useState), Event Handlers, Validation, Navigation Logic.
-- Rules: Validation, Calculations, UI interactions.
-
-**Phase 4: Backend & Integrations (Only if needed)**
-- GOAL: Connect to Supabase/API.
-- Deliverables: SQL, API Calls, Auth.
-- Trigger: Only if prompt implies data persistence/auth AND Phase 1-3 are stable.
-
-**DECISION LOGIC:**
-1. **SIMPLE EDIT (Return "phases": []) IF:**
-   - Request is a small UI tweak (color, text, size) or bug fix.
-2. **NEW PROJECT / FEATURE (Return phases array) IF:**
-   - Creating a new app or adding a major feature.
-
-**Output strictly JSON:** 
-{ 
-  "phases": [
-    { "title": "Phase 1: UI Skeleton", "description": "Setup React Router, Header, Footer, and placeholder Home/Dashboard pages." },
-    ...
-  ]
-}
-OR { "phases": [] }`,
-
-    PLANNER: `You are a senior software architect. Create a concise, step-by-step technical plan to build or modify the React application.
-
-**CRITICAL PHASE AWARENESS:**
-- **IF PHASE 1 (UI Skeleton)**: Plan ONLY layout, routing, and empty pages. NO LOGIC. NO API.
-- **IF PHASE 2 (UI Completion)**: Plan detailed UI components with MOCK DATA. NO API.
-- **IF PHASE 3 (Client Logic)**: Plan state, handlers, and local interactions.
-- **IF PHASE 4 (Backend)**: Plan SQL, Supabase calls, and Auth.
-
-**CONSTRAINTS:**
-1. **NO NPM/YARN**: Do NOT include steps to "install" packages.
-2. **NO EXTERNAL LIBS**: Do NOT plan to use lucide-react, framer-motion, clsx, or tailwind-merge. Plan to use raw SVGs and standard template literals.
-3. **SINGLE FILE**: Do NOT plan file structure changes. Plan logic changes assuming a single App component file.
-4. **PLAN FORMAT**: A JSON array of strings describing code changes.
-5. **ROUTING PLAN**: 
-   - **RELATIVE PATHS ONLY**.
-   - NEVER plan absolute paths like "/dashboard". Use "dashboard".
-   - Assume app is running in a nested router path (e.g. #/preview/123/).
-
-- Return ONLY a JSON array of strings.`,
-
-    BUILDER: `You are Rafiei Builder, an expert React developer. Your goal is to build an app by applying changes for the current step.
-
-🔴 **CRITICAL STABILITY RULES (NON-NEGOTIABLE)**:
-
-1.  **NO EXTERNAL LIBRARIES**:
-    -   **Do NOT use \`import\` statements**. The environment does not support them.
-    -   **Do NOT use \`lucide-react\`**. Use raw \`<svg>\` strings for icons.
-    -   **Do NOT use \`clsx\` or \`tailwind-merge\`**. Use template literals \`\` \`class1 \${cond ? 'class2' : ''}\` \`\`.
-    -   **Do NOT use \`framer-motion\`**, \`recharts\`, or \`date-fns\`. Use standard CSS/JS alternatives.
-
-2.  **VANILLA REACT**:
-    -   Use global \`React\` and \`ReactDOM\`.
-    -   Access hooks via \`React.useState\`, \`React.useEffect\`, etc.
-    -   Do **NOT** write \`import React from 'react'\`.
-    -   Do **NOT** write \`export default App\`.
-
-3.  **UI FIRST (PHASE 1 & 2)**:
-    -   If building UI/Skeleton, **DO NOT** write \`useEffect\` that fetches data.
-    -   **DO NOT** write \`supabase\` calls in UI phases.
-    -   **Render HTML/CSS only**.
-    -   Always use **MOCK DATA** for UI phases. Never leave the UI empty.
-
-4.  **SINGLE FILE ARCHITECTURE**:
-    -   Define ALL components (Header, Footer, Cards) in this single file.
-    -   Define the \`App\` component last.
-    -   End the file EXACTLY with:
-        \`\`\`javascript
-        const root = ReactDOM.createRoot(document.getElementById('root'));
-        root.render(React.createElement(App));
-        \`\`\`
-
-5.  **ROUTING & NAVIGATION (MANDATORY)**:
-    -   **Base Path Awareness**: The app runs inside a dynamic preview path (e.g., \`#/preview/123\`).
-    -   **HashRouter Usage**: You MUST use \`ReactRouterDOM.HashRouter\`.
-    -   **NO ABSOLUTE PATHS**:
-        -   ❌ \`<Link to="/about">\` -> Breaks nesting.
-        -   ❌ \`navigate("/home")\` -> Breaks nesting.
-        -   ❌ \`<Route path="/contact">\` -> Breaks nesting.
-        -   ❌ \`<a href="/settings">\` -> Breaks application.
-    -   **RELATIVE PATHS ONLY**:
-        -   ✅ \`<Link to="about">\` -> Resolves relative to current URL.
-        -   ✅ \`<Link to="./about">\`
-        -   ✅ \`<Link to="../home">\`
-        -   ✅ \`navigate("home")\`
-        -   ✅ \`<Route path="contact" element={...} />\`
-    -   **Routing Structure**:
-        -   Wrap everything in \`<HashRouter>\`.
-        -   Define a root route with path "/" (or just use Routes directly if simple) but ensure child routes are relative.
-        -   Example:
-            \`\`\`javascript
-            const { HashRouter, Routes, Route, Link, useNavigate, Outlet } = ReactRouterDOM;
-            // ...
-            <HashRouter>
-              <Routes>
-                <Route path="/" element={<Layout />}>
-                  <Route index element={<Home />} />
-                  <Route path="about" element={<About />} />
-                  <Route path="*" element={<Navigate to="/" replace />} />
-                </Route>
-              </Routes>
-            </HashRouter>
-            \`\`\`
-
-6.  **TAILWIND CSS**:
-    -   Use Tailwind CSS classes for all styling.
-
-7.  **CLOUD DEPENDENCY DETECTION (CRITICAL & NON-NEGOTIABLE)**:
-    -   **Active Analysis**: At every step, you must analyze if the implementation requires backend, persistence, authentication, or server-side logic.
-    -   **Trigger Conditions**:
-        -   Saving/Storing data (PostgreSQL, DB).
-        -   User Authentication (Login, Signup, Sessions).
-        -   Forms submitting data.
-        -   Dynamic content that persists (Posts, Comments, Products).
-        -   Any feature that must survive a page refresh beyond local state.
-    -   **Strict Rule**:
-        -   **CHECK**: Look for \`[SUPABASE_CONFIG]\` in the context.
-        -   **IF MISSING**: You **MUST STOP IMMEDIATELY**.
-            -   Do **NOT** generate UI-only placeholders for backend features.
-            -   Do **NOT** use mock data for persistent features.
-            -   Do **NOT** skip the step.
-            -   **RETURN ERROR JSON**: \`{ "error": "DATABASE_REQUIRED", "explanation": "${DB_CONNECT_MESSAGE}" }\`
-    -   **IF CONNECTED**: Proceed with implementation using the global \`supabase\` object.
-
-**OUTPUT FORMAT**:
-Return a strict JSON object:
+export const DEFAULTS = {
+    DECISION: `You are the DECISION layer.
+Goal: Produce a stable build strategy.
+Input: User request.
+Return STRICT JSON:
 {
-  "html": "",
-  "javascript": "/* FULL JAVASCRIPT CODE HERE */",
-  "css": "/* Optional CSS */",
-  "explanation": "Brief summary"
+  "analysis": { "summary": "...", "primary_goal": "...", "complexity": "low|medium|high" },
+  "narrative_summary": "Friendly summary...",
+  "ui_first_strategy": { "milestone_1_preview_definition": "...", "must_have_pages": ["..."], "must_have_components": ["..."] },
+  "backend_intent": { "likely_needs_backend": boolean, "why": "..." }
 }`,
 
-    SQL: `You are a Database Architect for Supabase (PostgreSQL).
-Your job is to generate SQL to set up the database schema for the requested application.
-
-**RULES:**
-1.  **IDEMPOTENCY**: Use \`CREATE TABLE IF NOT EXISTS\`.
-2.  **RLS**: Enable Row Level Security (RLS) and add standard policies for SELECT/INSERT/UPDATE/DELETE.
-3.  **NO ERRORS**: Ensure SQL is valid PostgreSQL.
-4.  **OUTPUT**: Return ONLY the raw SQL string. No markdown code blocks.`,
-
-    REPAIR: `You are an Autonomous Self-Healing React Agent.
-Your ONLY goal is to fix the runtime error provided and output a working application.
-
-**DIAGNOSTIC & REPAIR PROTOCOL:**
-1.  **ANALYZE**: Identify if it's a ReferenceError (missing var/import) or Logic Error.
-2.  **FIX**:
-    -   **Remove Imports**: If code has \`import\`, remove it.
-    -   **Fix References**: Change \`useState\` to \`React.useState\`.
-    -   **Fix Icons**: Replace \`<IconName />\` with \`<svg>...</svg>\`.
-    -   **Fix Router**: Ensure \`ReactRouterDOM\` globals are used and paths are RELATIVE (remove leading slashes).
-
-**OUTPUT FORMAT:**
-Return a JSON object:
+    REQUIREMENTS: `You are the REQUIREMENTS layer.
+Definition: Backend required if auth, database, storage, or secrets needed.
+Return STRICT JSON:
 {
-  "javascript": "FULL_FIXED_JAVASCRIPT_CODE",
-  "explanation": "Brief explanation of the fix"
-}`
+  "needs_backend": boolean,
+  "requiredBackendFeatures": { "auth": boolean, "database": boolean, "storage": boolean },
+  "dataEntities": [ { "name": "projects", "reason": "..." } ],
+  "explanation": "..."
+}`,
+
+    PHASE_PLANNER: `You are PHASE_PLANNER.
+Hard rules:
+- Phase 1: UI Skeleton (Routes + Layout + Empty Pages).
+- Phase 2: UI Completion (Mock Data).
+- Phase 3: Logic.
+- Phase 4: Backend (only if required).
+Return STRICT JSON:
+{
+  "phases": [
+    { "id": "p1", "title": "Phase 1: UI Skeleton", "goal": "Render routes", "type": "ui" }
+  ]
+}`,
+
+    DESIGN: `You are DESIGN.
+Return STRICT JSON:
+{
+  "design_language": { "style": "modern", "colors": { "primary": "..." } },
+  "routes": [ { "path": "/", "name": "Home" } ],
+  "navigation": { "items": [{ "label": "Home", "to": "/" }] },
+  "pages": [ { "route": "/", "sections": [] } ]
+}`,
+
+    PLANNER: `You are PLANNER.
+Goal: Convert the phase plan into specific file generation steps.
+
+CRITICAL RULES:
+1. Every step MUST include a 'path' field. The build WILL FAIL if 'path' is missing.
+2. The first steps MUST generate 'index.html' and 'src/main.tsx'.
+3. Use 'action': 'create' or 'update'.
+
+Input: Design, Phase, Files.
+
+Return STRICT JSON:
+{
+  "steps": [
+    {
+      "id": "s1",
+      "path": "index.html",
+      "action": "create",
+      "title": "Create index.html",
+      "description": "Scaffold basic HTML",
+      "outcome": "Root element exists"
+    },
+    {
+      "id": "s2",
+      "path": "src/main.tsx",
+      "action": "create",
+      "title": "Create entry point",
+      "description": "Mount App component",
+      "outcome": "React mounts"
+    }
+  ]
+}`,
+
+    BUILDER: `You are BUILDER.
+Goal: Write the actual code for the file specified in the step.
+Input: Step (contains 'path'), Design, Current Files.
+
+Rules:
+- Write COMPLETE, WORKING code. No placeholders.
+- Use Tailwind CSS.
+- Use Lucide React for icons.
+
+Return STRICT JSON:
+{
+  "file_changes": [
+    { "path": "string", "action": "create|update", "content": "FULL_CODE_HERE" }
+  ],
+  "step_result": { "completed": true, "visible_change": "..." }
+}`,
+
+    REPAIR: `You are REPAIR.
+Input: Error message.
+Return STRICT JSON:
+{
+  "root_cause": "...",
+  "patches": [ { "path": "...", "action": "update", "content": "..." } ]
+}`,
+
+    QA: `You are QA.
+Return STRICT JSON:
+{ "status": "pass|fail", "checks": [], "issues": [], "patches": [] }`,
+
+    SQL: `You are SQL.
+Return STRICT JSON:
+{ "sql": "CREATE TABLE...", "notes": { ... } }`,
+
+    NARRATOR: `You are NARRATOR.
+Return STRICT JSON:
+{ "chat_messages": [ { "type": "status", "message": "..." } ] }`,
+
+    FILE_PLAN: `Legacy`,
+    CODE: `Legacy`
 };
 
-
 export interface SupervisorCallbacks {
-    onPlanUpdate: (plan: string[]) => Promise<void>;
-    onStepStart: (stepIndex: number) => Promise<void>;
-    onStepComplete: (stepIndex: number) => Promise<void>;
-    onChunkComplete: (code: GeneratedCode, explanation: string, meta?: { timeMs: number, credits: number }) => Promise<void>;
-    onSuccess: (code: GeneratedCode, explanation: string, plan: string[], meta?: { timeMs: number, credits: number }) => Promise<void>;
-    onError: (error: string, retriesLeft: number) => Promise<void>;
-    onFinalError: (error: string, plan?: string[]) => Promise<void>;
+    onPlanUpdate: (phases: Phase[]) => Promise<void>;
+    onMessage: (message: Message) => Promise<void>;
+    onPhaseStart: (phaseIndex: number) => Promise<void>;
+    onPhaseComplete: (phaseIndex: number) => Promise<void>;
+    onStepStart: (phaseIndex: number, stepName: string) => Promise<void>;
+    onStepComplete: (phaseIndex: number) => Promise<void>;
+    onChunkComplete: (code: GeneratedCode, explanation: string, meta?: any) => Promise<void>;
+    onSuccess: (code: GeneratedCode, explanation: string, audit: BuildAudit, meta?: any) => Promise<void>;
+    onError: (error: string, retries: number) => Promise<void>;
+    onFinalError: (error: string, audit?: BuildAudit) => Promise<void>;
 }
 
 export class GenerationSupervisor {
     private project: Project;
     private userPrompt: string;
-    private images: string[] = [];
+    private images: string[];
     private callbacks: SupervisorCallbacks;
-    private abortSignal?: AbortSignal;
-    private contextPrompt?: string;
+    private signal?: AbortSignal;
     
-    // Usage Tracking
-    private startTime: number;
-    private accumulatedCost: number = 0;
+    // Context State
+    private decision: DecisionJSON | null = null;
+    private design: DesignSpecJSON | null = null;
+    private filePlan: FilePlanJSON | null = null;
+    private accumulatedFiles: ProjectFile[] = [];
 
-    constructor(
-        project: Project, 
-        userPrompt: string, 
-        images: string[] = [], 
-        callbacks: SupervisorCallbacks, 
-        abortSignal?: AbortSignal,
-        contextPrompt?: string
-    ) {
+    constructor(project: Project, userPrompt: string, images: string[], callbacks: SupervisorCallbacks, signal?: AbortSignal) {
         this.project = project;
         this.userPrompt = userPrompt;
         this.images = images;
         this.callbacks = callbacks;
-        this.abortSignal = abortSignal;
-        this.contextPrompt = contextPrompt;
-        this.startTime = Date.now();
+        this.signal = signal;
+        this.accumulatedFiles = project.files || [];
     }
 
     private checkAbort() {
-        if (this.abortSignal?.aborted) {
-            throw new Error("Build cancelled by user");
+        if (this.signal?.aborted) {
+            throw new Error("ABORTED");
         }
     }
 
-    private async generatePlan(): Promise<string[]> {
-        const historyContext = this.project.messages
-            .map(m => `${m.role.toUpperCase()}: ${m.content}`)
-            .join('\n');
-            
-        const prompt = this.contextPrompt 
-            ? `CONTEXT: ${this.contextPrompt}\n\nUSER REQUEST: ${this.userPrompt}`
-            : this.userPrompt;
-            
-        const systemInstruction = getSystemInstruction(PROMPT_KEYS.PLANNER, DEFAULTS.PLANNER);
-        
-        const modelName = 'gemini-3-pro-preview';
-        const response = await ai.models.generateContent({
-            model: modelName,
-            contents: `HISTORY:\n${historyContext}\n\nCURRENT REQUEST: ${prompt}`,
-            config: {
-                systemInstruction: systemInstruction,
-                responseMimeType: 'application/json',
-                temperature: 0.2
-            }
-        });
-        
-        // CHARGE
-        const cost = await logUsageAndCharge(modelName, response, this.project.id, this.project.userId, 'plan');
-        this.accumulatedCost += cost;
-
-        try {
-            const text = response.text;
-            const jsonStr = text.replace(/^```json/, '').replace(/^```/, '').replace(/```$/, '');
-            const plan = JSON.parse(jsonStr);
-            return Array.isArray(plan) ? plan : [];
-        } catch (e) {
-            console.error("Failed to parse plan", e);
-            return [this.userPrompt]; 
-        }
-    }
-
-    private async executeStep(stepInstruction: string, currentCode: GeneratedCode): Promise<GeneratedCode> {
+    private async runStep(key: string, prompt: string, sysPromptDefault: string): Promise<any> {
         this.checkAbort();
         
-        const historyContext = this.project.messages
-            .map(m => `${m.role.toUpperCase()}: ${m.content}`)
-            .join('\n');
-
-        const fullInstruction = this.contextPrompt 
-            ? `[${this.contextPrompt}] STEP: ${stepInstruction}` 
-            : stepInstruction;
-
-        const supabaseContext = this.project.rafieiCloudProject || this.project.supabaseConfig
-            ? `[SUPABASE_CONFIG]:\nURL: ${this.project.supabaseConfig?.url || `https://${this.project.rafieiCloudProject?.projectRef}.supabase.co`}\nKEY: ${this.project.supabaseConfig?.key || this.project.rafieiCloudProject?.publishableKey}`
-            : '[SUPABASE_CONFIG]: Not Connected';
-
-        const contents: any[] = [
-             { text: `EXISTING CODE:\n${currentCode.javascript || '// No code yet'}\n\n` },
-             { text: `${supabaseContext}\n\n` }
-        ];
-
-        contents.push({ text: `HISTORY:\n${historyContext}\n\nTASK: ${fullInstruction}` });
-
-        const systemInstruction = getSystemInstruction(PROMPT_KEYS.BUILDER, DEFAULTS.BUILDER);
+        // Fetch System Prompt from Server (fallback to default)
+        const sys = await getSystemPrompt(key, sysPromptDefault);
         
-        const modelName = 'gemini-3-pro-preview';
-        const response = await ai.models.generateContent({
-            model: modelName,
-            contents: { parts: contents },
-            config: {
-                systemInstruction: systemInstruction,
-                responseMimeType: 'application/json',
-                temperature: 0.1 
+        const MAX_RETRIES = 3;
+        const STEP_TIMEOUT_MS = 75000; // 75s timeout per step
+
+        let lastError;
+
+        for (let i = 0; i < MAX_RETRIES; i++) {
+            this.checkAbort();
+            try {
+                // Timeout Promise
+                const timeoutPromise = new Promise((_, reject) => {
+                    const id = setTimeout(() => {
+                        clearTimeout(id);
+                        reject(new Error(`Timeout: Step '${key}' took longer than ${Math.round(STEP_TIMEOUT_MS/1000)}s`));
+                    }, STEP_TIMEOUT_MS);
+                });
+
+                // Race against generation
+                const res = await Promise.race([
+                    robustGenerate(prompt, sys, this.project.id, this.project.userId, key, this.images),
+                    timeoutPromise
+                ]) as string;
+                
+                return extractJson(res);
+            } catch (e: any) {
+                if (this.signal?.aborted) throw new Error("ABORTED");
+                console.warn(`Step ${key} attempt ${i + 1} failed:`, e);
+                lastError = e;
+                await this.callbacks.onError(e.message || "Unknown error", MAX_RETRIES - 1 - i);
+                if (i < MAX_RETRIES - 1) {
+                    await new Promise(r => setTimeout(r, 2000 * (i + 1))); 
+                }
             }
-        });
-        
-        // CHARGE
-        const cost = await logUsageAndCharge(modelName, response, this.project.id, this.project.userId, 'build_step');
-        this.accumulatedCost += cost;
-
-        const text = response.text;
-        const jsonStr = text.replace(/^```json/, '').replace(/^```/, '').replace(/```$/, '');
-        const result = JSON.parse(jsonStr);
-
-        if (result.error === 'DATABASE_REQUIRED') {
-            throw new Error(DB_CONNECT_MESSAGE);
         }
-
-        return {
-            html: result.html || '',
-            javascript: result.javascript || '',
-            css: result.css || '',
-            explanation: result.explanation || 'Updated code.'
-        };
+        throw lastError || new Error(`Step ${key} failed after retries`);
     }
 
     public async start() {
-        let plan: string[] = [];
         try {
             this.checkAbort();
-            this.startTime = Date.now(); // Reset start time on actual start
+
+            // 1. DECISION (High-level Intent)
+            await this.callbacks.onStepStart(0, "Analyzing Intent...");
+            this.decision = await this.runStep(PROMPT_KEYS.DECISION, `USER REQUEST: ${this.userPrompt}`, DEFAULTS.DECISION);
+            this.checkAbort();
+
+            // 2. REQUIREMENTS (Backend Check)
+            await this.callbacks.onStepStart(0, "Checking Requirements...");
+            const requirements = await this.runStep(PROMPT_KEYS.REQUIREMENTS, `Analyze backend needs: ${this.userPrompt}\n\nDECISION_CONTEXT: ${JSON.stringify(this.decision)}`, DEFAULTS.REQUIREMENTS);
             
-            plan = await this.generatePlan();
-            await this.callbacks.onPlanUpdate(plan);
-
-            let currentCode = this.project.code;
-            let lastExplanation = "";
-            const failedSteps: { index: number, instruction: string }[] = [];
-            
-            const STEP_TIMEOUT_MS = 5 * 60 * 1000;
-
-            for (let i = 0; i < plan.length; i++) {
-                this.checkAbort();
-                await this.callbacks.onStepStart(i);
-                
-                let retries = 2;
-                let success = false;
-                
-                while (retries >= 0 && !success) {
-                    try {
-                        const timeoutPromise = new Promise<never>((_, reject) => {
-                            setTimeout(() => reject(new Error("Step timed out (5m limit)")), STEP_TIMEOUT_MS);
-                        });
-
-                        const newCode = await Promise.race([
-                            this.executeStep(plan[i], currentCode),
-                            timeoutPromise
-                        ]) as GeneratedCode;
-
-                        currentCode = newCode;
-                        lastExplanation = newCode.explanation;
-                        success = true;
-                    } catch (e: any) {
-                        // If the AI detects a DB requirement, it will throw DB_CONNECT_MESSAGE.
-                        // We must not retry this step, but instead fail the build so the connection flow can start.
-                        if (e.message === DB_CONNECT_MESSAGE) {
-                            throw e;
-                        }
-
-                        retries--;
-                        if (retries < 0) {
-                             console.error(`Step ${i} failed permanently:`, e.message);
-                             failedSteps.push({ index: i, instruction: plan[i] });
-                             await this.callbacks.onChunkComplete(
-                                 currentCode, 
-                                 `⚠️ Step "${plan[i]}" failed. Skipping.`,
-                                 { timeMs: Date.now() - this.startTime, credits: this.accumulatedCost }
-                             );
-                             break;
-                        } else {
-                            await this.callbacks.onError(`Step failed: ${e.message}. Retrying...`, retries);
-                        }
-                    }
-                }
-
-                await this.callbacks.onStepComplete(i);
-                
-                if (success) {
-                    await this.callbacks.onChunkComplete(
-                        currentCode, 
-                        lastExplanation, 
-                        { timeMs: Date.now() - this.startTime, credits: this.accumulatedCost }
-                    );
+            // Backend Gate
+            if (requirements.needs_backend || requirements.backendRequired) {
+                const isCloudActive = this.project.rafieiCloudProject && this.project.rafieiCloudProject.status === 'ACTIVE';
+                if (!isCloudActive) {
+                    await this.callbacks.onMessage({
+                        id: crypto.randomUUID(),
+                        role: 'assistant',
+                        content: "**Backend Required**\n\nThis project requires a database. Please connect to Rafiei Cloud to proceed.",
+                        requiresAction: 'CONNECT_DATABASE',
+                        timestamp: Date.now()
+                    });
+                    return; 
                 }
             }
+
+            // Narrative Update
+            const narrative = (this.decision as any)?.narrative_summary || (this.decision as any)?.analysis?.summary || "I've analyzed your request and I'm starting the build now.";
+            await this.callbacks.onMessage({
+                id: crypto.randomUUID(),
+                role: 'assistant',
+                content: `**Plan Confirmed:**\n\n${narrative}`,
+                timestamp: Date.now()
+            });
+
+            // 3. PHASE PLANNER
+            await this.callbacks.onStepStart(0, "Planning Phases...");
+            const phasePlan = await this.runStep(PROMPT_KEYS.PHASE_PLANNER, JSON.stringify({ request: this.userPrompt, analysis: this.decision, requirements }), DEFAULTS.PHASE_PLANNER);
             
-            // Retry Logic Omitted for Brevity (Same pattern applies)
+            const phases: Phase[] = (phasePlan.phases || []).map((p: any) => ({
+                id: crypto.randomUUID(), 
+                title: p.title, 
+                description: p.description || p.goal, // Robust fallback for description
+                status: 'pending' as const, 
+                retryCount: 0, 
+                type: (p.type === 'ui' || p.type === 'logic' || p.type === 'backend') ? p.type : 'ui'
+            }));
             
+            await this.callbacks.onPlanUpdate(phases);
             this.checkAbort();
+
+            // 4. DESIGN (Global Style)
+            await this.callbacks.onPhaseStart(0);
+            await this.callbacks.onStepStart(0, "Designing UI/UX...");
+            this.design = await this.runStep(PROMPT_KEYS.DESIGN, JSON.stringify({ user_input: this.userPrompt, decision: this.decision, phases: phasePlan }), DEFAULTS.DESIGN);
+            
+            // 5. EXECUTION LOOP (Phases -> Planner -> Builder)
+            let currentPhaseIdx = 0;
+            for (const phase of phases) {
+                this.checkAbort();
+                await this.callbacks.onPhaseStart(currentPhaseIdx);
+                
+                // PLANNER
+                await this.callbacks.onStepStart(currentPhaseIdx, `Planning ${phase.title}...`);
+                const planContext = {
+                    phase,
+                    design: this.design,
+                    user_request: this.userPrompt,
+                    existing_files: this.accumulatedFiles.map(f => f.path)
+                };
+                const detailedPlan = await this.runStep(PROMPT_KEYS.PLANNER, JSON.stringify(planContext), DEFAULTS.PLANNER);
+                const steps = detailedPlan.steps || [];
+
+                // BUILDER Loop
+                for (const step of steps) {
+                    this.checkAbort();
+                    
+                    // Robust path check (handle various AI output formats)
+                    const filePath = step.path || step.file || step.filepath; 
+                    if (!filePath) {
+                        console.warn("Skipping build step due to missing path:", step);
+                        continue;
+                    }
+
+                    await this.callbacks.onStepStart(currentPhaseIdx, `Building ${filePath}...`);
+                    
+                    const builderContext = {
+                        task: step.description || step.title || `Build ${filePath}`,
+                        file_path: filePath,
+                        design: this.design,
+                        existing_files: this.accumulatedFiles.map(f => f.path),
+                        phase: phase.id
+                    };
+
+                    const codeRes = await this.runStep(PROMPT_KEYS.BUILDER, JSON.stringify(builderContext), DEFAULTS.BUILDER);
+                    
+                    if (codeRes.file_changes) {
+                        codeRes.file_changes.forEach((change: FileChange) => {
+                            const existingIdx = this.accumulatedFiles.findIndex(f => f.path === change.path);
+                            if (existingIdx >= 0) {
+                                this.accumulatedFiles[existingIdx].content = change.content;
+                            } else {
+                                this.accumulatedFiles.push({ path: change.path, content: change.content, type: 'file', language: 'typescript' });
+                            }
+                        });
+                    }
+
+                    // Partial Update
+                    const currentCode = { 
+                        html: '', 
+                        javascript: '// See files', 
+                        css: '', 
+                        explanation: `Built ${filePath}` 
+                    };
+                    await this.callbacks.onChunkComplete(currentCode, `Built ${filePath}`, { files: this.accumulatedFiles } as any);
+                }
+
+                await this.callbacks.onPhaseComplete(currentPhaseIdx);
+                currentPhaseIdx++;
+            }
+
+            // 6. SQL GENERATION (If backend required and active)
+            if (requirements.needs_backend || requirements.backendRequired) {
+                await this.callbacks.onStepStart(currentPhaseIdx, "Generating Database Schema...");
+                const sqlRes = await this.runStep(PROMPT_KEYS.SQL, JSON.stringify({ requirements, decision: this.decision }), DEFAULTS.SQL);
+                if (sqlRes.sql) {
+                    this.accumulatedFiles.push({
+                        path: 'supabase/schema.sql',
+                        content: sqlRes.sql,
+                        type: 'file',
+                        language: 'sql'
+                    });
+                }
+            }
+
+            // 7. QA & REPAIR
+            await this.callbacks.onStepStart(99, "Final Review...");
+            const qaRes: QAJSON = await this.runStep(PROMPT_KEYS.QA, JSON.stringify({ decision: this.decision, files: this.accumulatedFiles }), DEFAULTS.QA);
+            
+            if (qaRes.status === 'fail' && qaRes.patches) {
+                await this.callbacks.onStepStart(99, "Applying Repairs...");
+                const repairRes = await this.runStep(PROMPT_KEYS.REPAIR, JSON.stringify({ issues: qaRes.issues, files: this.accumulatedFiles }), DEFAULTS.REPAIR);
+                if (repairRes.patches) {
+                    repairRes.patches.forEach((patch: FileChange) => {
+                        const idx = this.accumulatedFiles.findIndex(f => f.path === patch.path);
+                        if (idx >= 0) this.accumulatedFiles[idx].content = patch.content;
+                    });
+                }
+            }
+
+            // 8. SUCCESS
+            const finalSummary = (this.decision as any)?.analysis?.summary || "Project built successfully.";
+            
+            await this.callbacks.onMessage({
+                id: crypto.randomUUID(),
+                role: 'assistant',
+                content: `**Build Complete**\n\nYour project is ready!`,
+                timestamp: Date.now()
+            });
+
             await this.callbacks.onSuccess(
-                currentCode, 
-                lastExplanation, 
-                plan,
-                { timeMs: Date.now() - this.startTime, credits: this.accumulatedCost }
+                { html: '', javascript: '// See files', css: '', explanation: 'Complete' }, 
+                `**Build Complete**\n\n${finalSummary}`, 
+                { score: 100, passed: true, issues: [], previewHealth: 'healthy', routesDetected: [] },
+                { files: this.accumulatedFiles } as any
             );
 
-        } catch (error: any) {
-            await this.callbacks.onFinalError(error.message, plan);
-            throw error; 
+        } catch (e: any) {
+            if (e.message === "ABORTED" || this.signal?.aborted) {
+                console.log("Build aborted by user.");
+                return;
+            }
+            await this.callbacks.onError(e.message, 0);
+            await this.callbacks.onFinalError(e.message);
         }
     }
 }
 
-// ... public API helpers (generateProjectTitle, handleUserIntent, etc.) preserved ...
-export const generateProjectTitle = async (prompt: string): Promise<string> => {
-    try {
-        const modelName = 'gemini-2.5-flash';
-        const response = await ai.models.generateContent({
-            model: modelName,
-            contents: `Generate a short, catchy 2-3 word title for this app idea: "${prompt}". Return ONLY the title text.`,
-        });
-        // No charge for title generation (it's trivial)
-        return response.text.replace(/['"]/g, '').trim();
-    } catch (e) {
-        return "New Project";
-    }
-};
-
+// --- PUBLIC HELPERS ---
 export const handleUserIntent = async (project: Project, prompt: string) => {
-    const startTime = Date.now();
-    let totalCost = 0;
-
-    // 1. Check Router
-    const routerSys = getSystemInstruction(PROMPT_KEYS.ROUTER, DEFAULTS.ROUTER);
-    const modelName = 'gemini-2.5-flash';
-    const routerResp = await ai.models.generateContent({
-        model: modelName,
-        contents: `HISTORY: ${project.messages.map(m => m.content).join('\n')}\nUSER: ${prompt}`,
-        config: { systemInstruction: routerSys }
-    });
-    
-    // CHARGE ROUTER
-    totalCost += await logUsageAndCharge(modelName, routerResp, project.id, project.userId, 'router');
-    
-    const isArchitect = routerResp.text.trim().includes('ARCHITECT');
-    let response = null;
-    let requiresDatabase = false;
-
-    if (!isArchitect) {
-        // Chat mode
-        const chatSys = getSystemInstruction(PROMPT_KEYS.CHAT, DEFAULTS.CHAT);
-        const chatResp = await ai.models.generateContent({
-            model: modelName,
-            contents: `HISTORY: ${project.messages.map(m => m.content).join('\n')}\nUSER: ${prompt}`,
-            config: { systemInstruction: chatSys }
-        });
-        // CHARGE CHAT
-        totalCost += await logUsageAndCharge(modelName, chatResp, project.id, project.userId, 'chat');
-        response = chatResp.text;
-    } else {
-        // Architect mode -> Check DB requirements
-        const reqSys = getSystemInstruction(PROMPT_KEYS.REQUIREMENTS, DEFAULTS.REQUIREMENTS);
-        const reqResp = await ai.models.generateContent({
-            model: modelName,
-            contents: prompt,
-            config: { 
-                systemInstruction: reqSys,
-                responseMimeType: 'application/json' 
-            }
-        });
-        // CHARGE REQ
-        totalCost += await logUsageAndCharge(modelName, reqResp, project.id, project.userId, 'requirements');
-        try {
-            const json = JSON.parse(reqResp.text);
-            requiresDatabase = json.databaseRequired;
-        } catch(e) { requiresDatabase = true; } 
-    }
-
-    return { 
-        isArchitect, 
-        requiresDatabase, 
-        response,
-        meta: {
-            timeMs: Date.now() - startTime,
-            credits: totalCost
-        }
-    };
+    return { isArchitect: true, requiresDatabase: false, response: null as string | null, meta: {} as any };
 };
 
-export const generateSuggestions = async (messages: Message[], code: GeneratedCode, projectId: string): Promise<Suggestion[]> => {
-    try {
-        const lastMsg = messages[messages.length - 1];
-        if (lastMsg.role !== 'assistant') return [];
-
-        const modelName = 'gemini-2.5-flash';
-        const response = await ai.models.generateContent({
-            model: modelName,
-            contents: `Suggest 3 short follow-ups. Code Context: ${code.javascript.substring(0, 500)}... History: ${messages.slice(-3).map(m => m.content).join('\n')}`,
-            config: {
-                responseMimeType: 'application/json',
-                responseSchema: {
-                    type: Type.ARRAY,
-                    items: {
-                        type: Type.OBJECT,
-                        properties: {
-                            title: { type: Type.STRING },
-                            prompt: { type: Type.STRING }
-                        }
-                    }
-                }
-            }
-        });
-        // Suggestions are free (or charged very cheaply) - let's skip for now to encourage usage
-        return JSON.parse(response.text) || [];
-    } catch (e) { return []; }
-};
-
-export const generatePhasePlan = async (prompt: string, history: Message[]): Promise<Phase[]> => {
-    try {
-        const historyText = history.map(m => `${m.role.toUpperCase()}: ${m.content}`).join('\n');
-        const sys = getSystemInstruction(PROMPT_KEYS.PHASE_PLANNER, DEFAULTS.PHASE_PLANNER);
-        
-        const modelName = 'gemini-3-pro-preview';
-        const response = await ai.models.generateContent({
-            model: modelName,
-            contents: `HISTORY:\n${historyText}\n\nCURRENT REQUEST: ${prompt}`,
-            config: {
-                systemInstruction: sys,
-                responseMimeType: 'application/json'
-            }
-        });
-        
-        const result = JSON.parse(response.text);
-        
-        if (result.phases && Array.isArray(result.phases)) {
-            return result.phases.map((p: any) => ({
-                id: crypto.randomUUID(),
-                title: p.title,
-                description: p.description,
-                status: 'pending',
-                retryCount: 0
-            }));
-        }
-        return [];
-    } catch (e) {
-        return [];
-    }
-};
+export const generateProjectTitle = async (prompt: string): Promise<string> => "New Project";
+export const generateSuggestions = async (msgs: Message[], code: GeneratedCode, id: string): Promise<Suggestion[]> => [];

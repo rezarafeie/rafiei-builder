@@ -11,6 +11,7 @@ interface CodeEditorProps {
   code: GeneratedCode | null;
   files?: ProjectFile[];
   isThinking?: boolean;
+  active?: boolean; // Optimization prop
 }
 
 // --- Virtual File System Types ---
@@ -139,7 +140,7 @@ const INITIAL_FILE_TREE: FileNode[] = [
     }
 ];
 
-const CodeEditor: React.FC<CodeEditorProps> = ({ code, files, isThinking = false }) => {
+const CodeEditor: React.FC<CodeEditorProps> = ({ code, files, isThinking = false, active = true }) => {
   // --- State ---
   const [fileTree, setFileTree] = useState<FileNode[]>(INITIAL_FILE_TREE);
   const [activeFileId, setActiveFileId] = useState<string>('App.tsx');
@@ -156,6 +157,9 @@ const CodeEditor: React.FC<CodeEditorProps> = ({ code, files, isThinking = false
   const contentEndRef = useRef<HTMLDivElement>(null);
   const streamRequestRef = useRef<number>(null);
   const prevCodeRef = useRef<GeneratedCode | null>(null);
+
+  // Detect Mobile
+  const isMobile = typeof window !== 'undefined' ? window.innerWidth < 768 : false;
 
   // --- Initialize Tree & Content ---
   useEffect(() => {
@@ -206,6 +210,9 @@ const CodeEditor: React.FC<CodeEditorProps> = ({ code, files, isThinking = false
 
   // --- Sync Code Prop Updates (AI Streaming) ---
   useEffect(() => {
+    // Optimization: Skip if not active
+    if (!active) return;
+
     if (!code || (files && files.length > 0)) return; // Skip if in file mode
 
     // Detect which file is changing primarily (Legacy Mode)
@@ -229,14 +236,20 @@ const CodeEditor: React.FC<CodeEditorProps> = ({ code, files, isThinking = false
     }
 
     prevCodeRef.current = code;
-  }, [code, isThinking, files, activeFileId]);
+  }, [code, isThinking, files, activeFileId, active]);
 
   // --- Content Streaming Logic ---
   useEffect(() => {
+    // Skip if not active
+    if (!active) return;
+
     const targetContent = fileContentMap[activeFileId] || '';
     
-    // If not thinking, show content immediately
-    if (!isThinking || activeFileId !== editingFileId) {
+    // Performance: Disable typing animation on mobile or for large files to prevent crashes
+    const shouldAnimate = isThinking && activeFileId === editingFileId && !isMobile && targetContent.length < 5000;
+
+    // If not thinking or should not animate, show content immediately
+    if (!shouldAnimate) {
         setDisplayedContent(targetContent);
         return;
     }
@@ -259,14 +272,14 @@ const CodeEditor: React.FC<CodeEditorProps> = ({ code, files, isThinking = false
 
     streamRequestRef.current = requestAnimationFrame(animate);
     return () => { if (streamRequestRef.current) cancelAnimationFrame(streamRequestRef.current); };
-  }, [fileContentMap, activeFileId, isThinking, editingFileId]);
+  }, [fileContentMap, activeFileId, isThinking, editingFileId, active, isMobile]);
 
   // --- Auto Scroll ---
   useEffect(() => {
-    if (autoScroll && contentEndRef.current && isThinking && activeFileId === editingFileId) {
+    if (active && autoScroll && contentEndRef.current && isThinking && activeFileId === editingFileId) {
         contentEndRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' });
     }
-  }, [displayedContent, autoScroll, isThinking, activeFileId, editingFileId]);
+  }, [displayedContent, autoScroll, isThinking, activeFileId, editingFileId, active]);
 
   // --- Event Handlers ---
   const toggleFolder = (folderId: string) => {
@@ -362,7 +375,10 @@ const CodeEditor: React.FC<CodeEditorProps> = ({ code, files, isThinking = false
       return findNode(actualRoot);
   }, [activeFileId, fileTree]);
 
-  const lines = useMemo(() => displayedContent.split('\n'), [displayedContent]);
+  // Optimization: Do not split and render if not active
+  const lines = useMemo(() => active ? displayedContent.split('\n') : [], [displayedContent, active]);
+
+  if (!active) return null; // Or return simplified placeholder
 
   return (
     <div className="flex h-full bg-[#020617] text-slate-300 font-mono text-sm border border-slate-800 rounded-lg overflow-hidden shadow-2xl">

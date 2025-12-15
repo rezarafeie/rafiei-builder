@@ -59,8 +59,8 @@ const PreviewPage: React.FC = () => {
         );
     }
 
-    // Pass projectId to allow the router shim to detect context
-    const srcDoc = constructFullDocument(project.code, projectId);
+    // Pass projectId to allow the router shim to detect context, AND files for virtual fs
+    const srcDoc = constructFullDocument(project.code, projectId, project.files);
 
     return (
         <iframe 

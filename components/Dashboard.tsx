@@ -13,9 +13,8 @@ import GitHubImportModal from './GitHubImportModal';
 import CreditBalanceModal from './CreditBalanceModal';
 import SqlSetupModal from './SqlSetupModal';
 import { 
-    Rocket, Wallet, Github, Shield, Check, Cloud, Loader2, Trash2, Sun, Moon, LogOut, 
-    Sparkles, Recycle, LayoutGrid, Undo2, X, Activity, ExternalLink, Power, LayoutDashboard,
-    LayoutTemplate, Terminal
+    Rocket, Wallet, Github, Shield, Cloud, Loader2, Trash2, Sun, Moon, LogOut, 
+    Sparkles, Recycle, LayoutGrid, Undo2, X, LayoutTemplate, ChevronDown
 } from 'lucide-react';
 
 interface DashboardProps {
@@ -102,7 +101,7 @@ const CloudDetailsModal: React.FC<{
                 </div>
 
                 <div className="mt-8 flex flex-col gap-3">
-                     <button onClick={onDisconnect} className="w-full px-4 py-2 text-sm bg-red-500/10 hover:bg-red-500/20 text-red-600 dark:text-red-400 border border-red-500/20 rounded-lg flex items-center justify-center gap-2"><Power size={16} /> Disconnect</button>
+                     <button onClick={onDisconnect} className="w-full px-4 py-2 text-sm bg-red-500/10 hover:bg-red-500/20 text-red-600 dark:text-red-400 border border-red-500/20 rounded-lg flex items-center justify-center gap-2"><Trash2 size={16} /> Disconnect</button>
                 </div>
              </div>
         </div>
@@ -135,13 +134,16 @@ const useInView = (options: IntersectionObserverInit) => {
 };
 
 const ProjectCard = React.memo(({ project, view, actionId, onSoftDelete, onRestore, onPermanentDelete, user, t }: any) => {
-    // Only load the heavy preview when the card is close to the viewport
     const [ref, isVisible] = useInView({ rootMargin: '200px' });
 
     const srcDoc = React.useMemo(() => {
-        if (!isVisible || (!project.code?.html && !project.code?.javascript)) return null;
-        return constructFullDocument(project.code, project.id);
-    }, [project.code, project.id, isVisible]);
+        const hasFiles = project.files && project.files.length > 0;
+        const hasCode = project.code?.html || project.code?.javascript;
+        
+        if (!isVisible || (!hasCode && !hasFiles)) return null;
+        
+        return constructFullDocument(project.code, project.id, project.files);
+    }, [project.code, project.files, project.id, isVisible]);
 
     return (
         <Link 
@@ -259,10 +261,14 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onLogout, view }) => {
   const [isSyncing, setIsSyncing] = useState(true);
   const [isCreating, setIsCreating] = useState(false);
   const [isConnectingCloud, setIsConnectingCloud] = useState(false);
+  const [isSystemOnline, setIsSystemOnline] = useState(true);
   
-  // Local state for credits to allow lazy loading
+  // Pagination State
+  const [hasMore, setHasMore] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const PROJECTS_PER_PAGE = 6;
+  
   const [currentBalance, setCurrentBalance] = useState(user.credits_balance);
-  
   const [actionId, setActionId] = useState<string | null>(null);
   
   const [showImportModal, setShowImportModal] = useState(false);
@@ -273,7 +279,6 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onLogout, view }) => {
 
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Check for pending prompts
   useEffect(() => {
     const pending = sessionStorage.getItem('rafiei_pending_prompt');
     if (pending) {
@@ -285,60 +290,87 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onLogout, view }) => {
     }
   }, []);
 
-  const fetchData = async () => {
-    setIsSyncing(true);
+  const fetchData = async (isLoadMore = false) => {
+    if (!isLoadMore) {
+        setIsSyncing(true);
+    } else {
+        setIsLoadingMore(true);
+    }
+
     try {
-        if (view === 'active') {
-            const p = await cloudService.getProjects(user.id);
-            setProjects(p);
-        } else {
-            const p = await cloudService.getTrashedProjects(user.id);
-            setProjects(p);
-        }
-        const count = await cloudService.getTrashCount(user.id);
-        setTrashCount(count);
+        const loadPromise = async () => {
+            const offset = isLoadMore ? projects.length : 0;
+            let fetched: Project[] = [];
+            
+            if (view === 'active') {
+                fetched = await cloudService.getProjects(user.id, PROJECTS_PER_PAGE, offset);
+            } else {
+                fetched = await cloudService.getTrashedProjects(user.id, PROJECTS_PER_PAGE, offset);
+            }
+            
+            if (isLoadMore) {
+                setProjects(prev => [...prev, ...fetched]);
+            } else {
+                setProjects(fetched);
+            }
+            
+            setHasMore(fetched.length === PROJECTS_PER_PAGE);
+
+            // Always verify global stats on initial load or re-sync
+            if (!isLoadMore) {
+                const count = await cloudService.getTrashCount(user.id);
+                setTrashCount(count);
+                if (currentBalance === -1) {
+                    const balance = await cloudService.getUserCredits(user.id);
+                    setCurrentBalance(balance);
+                }
+            }
+        };
+
+        const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Dashboard Load Timeout')), 10000));
+        await Promise.race([loadPromise(), timeoutPromise]);
         
-        // Lazy load credits if initial load skipped it
-        if (currentBalance === -1) {
-            const balance = await cloudService.getUserCredits(user.id);
-            setCurrentBalance(balance);
-        }
+        setIsSystemOnline(true);
     } catch (e: any) {
         console.error("Dashboard Load Error:", e);
+        setIsSystemOnline(false);
         if (e.name === 'DatabaseSetupError' || e.message.includes('TABLE_MISSING') || e.message.includes('RPC')) {
             setSqlError(e.message);
             setShowSqlWizard(true);
         }
     } finally {
-        setIsSyncing(false);
+        if (!isLoadMore) setIsSyncing(false);
+        else setIsLoadingMore(false);
     }
   };
 
+  // Reset on view change
   useEffect(() => {
-    // If parent prop updates (e.g. after a purchase callback reload in App), update local state
-    if (user.credits_balance !== -1) {
-        setCurrentBalance(user.credits_balance);
-    }
-    
-    fetchData();
-    // Realtime subscription
+    setProjects([]);
+    setHasMore(true);
+    fetchData(false);
+  }, [user.id, view]);
+
+  // Subscription for updates (Realtime)
+  useEffect(() => {
     const { unsubscribe } = cloudService.subscribeToUserProjects(user.id, () => {
-        // Debounce fetching to prevent crashes on rapid updates
         if (debounceRef.current) clearTimeout(debounceRef.current);
         debounceRef.current = setTimeout(() => {
-            fetchData();
+            // Re-fetch only the first page to ensure fresh data at the top, or refresh current list.
+            // For simplicity and correctness with "latest at top", we refresh from scratch.
+            fetchData(false);
         }, 1000);
     });
     return () => {
         unsubscribe();
         if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [user.id, view, user.credits_balance]);
+  }, [user.id, view]);
 
   const handleCreateProject = async (content: string, images: { url: string; base64: string }[]) => {
       setIsCreating(true);
       try {
-          const projectId = await cloudService.createNewProjectAndInitiateBuild(user, content, images);
+          const projectId = await cloudService.createProjectSkeleton(user, content, images);
           navigate(`/project/${projectId}`);
       } catch (e) {
           alert("Failed to create project");
@@ -364,7 +396,6 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onLogout, view }) => {
       setActionId(id);
       try {
           await cloudService.softDeleteProject(id);
-          // Subscription will update UI
       } catch (e) {
           console.error(e);
       } finally {
@@ -399,19 +430,7 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onLogout, view }) => {
       }
   };
 
-  const handleConnectCloud = async () => {
-      setIsConnectingCloud(true);
-      try {
-          alert("To connect a cloud, please open a specific project.");
-      } catch (e) {
-          console.error(e);
-      } finally {
-          setIsConnectingCloud(false);
-      }
-  };
-
   const handleDisconnect = async () => {
-      // Disconnect global cloud
       setShowCloudDetails(false);
   };
 
@@ -421,8 +440,8 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onLogout, view }) => {
       cloudService.saveUserLanguage(user.id, newLang).catch(console.error);
   };
 
-  const rafieiCloudProject: RafieiCloudProject | undefined = undefined; // Placeholder
-  const customBackendConfig: any = undefined; // Placeholder
+  const rafieiCloudProject: RafieiCloudProject | undefined = undefined; 
+  const customBackendConfig: any = undefined; 
 
   const greeting = (() => {
       const hour = new Date().getHours();
@@ -463,12 +482,11 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onLogout, view }) => {
             <SqlSetupModal 
                 isOpen={true} 
                 errorType={sqlError || "DASHBOARD_TRIGGER"} 
-                onRetry={fetchData} 
+                onRetry={() => fetchData(false)} 
                 onClose={() => setShowSqlWizard(false)} 
             />
         )}
         
-        {/* Header */}
         <header className="sticky top-0 z-30 w-full backdrop-blur-xl bg-white/80 dark:bg-[#020617]/80 border-b border-slate-200 dark:border-slate-800/50 transition-colors duration-300">
             <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
                 <div className="flex items-center gap-2">
@@ -477,10 +495,13 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onLogout, view }) => {
                             <Rocket size={20} className="text-indigo-600 dark:text-indigo-400" />
                         </div>
                         <span className="font-semibold text-slate-900 dark:text-white tracking-tight text-lg">{t('appName')}</span>
+                        <div 
+                            className={`w-2 h-2 rounded-full ml-1 ${isSystemOnline ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.5)]'}`} 
+                            title={isSystemOnline ? "System Online" : "System Offline"}
+                        ></div>
                     </Link>
                 </div>
                 <div className="flex items-center gap-3">
-                    {/* Credits Badge */}
                     <button onClick={() => setShowCreditModal(true)} className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 bg-emerald-50 dark:bg-emerald-900/10 rounded-full border border-emerald-200 dark:border-emerald-500/20 hover:bg-emerald-100 dark:hover:bg-emerald-900/30 transition-colors w-[100px] justify-center">
                         <Wallet size={14} className="text-emerald-600 dark:text-emerald-400" />
                         {currentBalance === -1 ? (
@@ -534,9 +555,7 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onLogout, view }) => {
             </div>
         </header>
 
-        {/* ... (rest of Dashboard main content) ... */}
         <main className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-12 flex flex-col gap-10">
-            {/* ... (Prompt input area, project grid, etc. - reused from existing file) */}
             {view === 'active' ? (
                 <div className="flex flex-col items-center justify-center space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
                     <h1 className="text-3xl md:text-5xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-slate-900 via-slate-700 to-slate-500 dark:from-white dark:via-slate-200 dark:to-slate-400 text-center tracking-tight">
@@ -559,7 +578,6 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onLogout, view }) => {
                 </div>
             )}
 
-            {/* ... (Project List - same as existing) ... */}
             <div className="space-y-6">
                 <div className="flex items-center justify-between pb-2">
                     <h3 className="text-lg font-semibold text-slate-700 dark:text-slate-200 flex items-center gap-2">
@@ -583,21 +601,35 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onLogout, view }) => {
                         <p className="text-slate-500 text-sm font-medium">{view === 'trash' ? t('emptyTrash') : t('noProjectsYet')}</p>
                     </div>
                 ) : (
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                        {projects.map((project) => (
-                            <ProjectCard
-                                key={project.id}
-                                project={project}
-                                view={view}
-                                actionId={actionId}
-                                onSoftDelete={handleSoftDelete}
-                                onRestore={handleRestore}
-                                onPermanentDelete={handlePermanentDelete}
-                                user={user}
-                                t={t}
-                            />
-                        ))}
-                    </div>
+                    <>
+                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                            {projects.map((project) => (
+                                <ProjectCard
+                                    key={project.id}
+                                    project={project}
+                                    view={view}
+                                    actionId={actionId}
+                                    onSoftDelete={handleSoftDelete}
+                                    onRestore={handleRestore}
+                                    onPermanentDelete={handlePermanentDelete}
+                                    user={user}
+                                    t={t}
+                                />
+                            ))}
+                        </div>
+                        {hasMore && (
+                            <div className="flex justify-center pt-4">
+                                <button 
+                                    onClick={() => fetchData(true)} 
+                                    disabled={isLoadingMore}
+                                    className="flex items-center gap-2 px-6 py-2.5 bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 rounded-full font-medium text-sm hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors disabled:opacity-50"
+                                >
+                                    {isLoadingMore ? <Loader2 size={16} className="animate-spin" /> : <ChevronDown size={16} />}
+                                    Load More Projects
+                                </button>
+                            </div>
+                        )}
+                    </>
                 )}
             </div>
         </main>
