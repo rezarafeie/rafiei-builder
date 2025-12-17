@@ -1,4 +1,14 @@
 
+export interface AIDebugLog {
+  id: string;
+  timestamp: number;
+  stepKey: string;
+  model: string;
+  systemInstruction: string;
+  prompt: string;
+  response: string;
+}
+
 export interface GeneratedCode {
   html: string;
   javascript: string;
@@ -52,21 +62,22 @@ export interface ProjectFile {
 export interface Message {
   id: string;
   role: 'user' | 'assistant' | 'system';
-  content: string;
+  content?: string;
   timestamp: number;
   images?: string[];
-  type?: 'job_summary';
-  jobSummary?: {
-    title: string;
-    plan: string[];
-    status: 'completed' | 'failed';
-    audit?: BuildAudit;
-  };
+  type?: 'user_input' | 'assistant_response' | 'build_plan' | 'build_phase' | 'build_status' | 'build_error' | 'action_required' | 'final_summary';
+  status?: 'pending' | 'working' | 'completed' | 'failed'; 
+  icon?: string; 
+  planData?: { title: string, status: 'pending' | 'active' | 'completed' | 'failed' }[];
+  currentStepProgress?: { current: number; total: number; stepName: string; };
+  details?: string;
+  isExpandable?: boolean;
   requiresAction?: string;
   executionTimeMs?: number;
   creditsUsed?: number;
   providerUsed?: string;
   modelUsed?: string;
+  aiInteractions?: AIDebugLog[]; // Added for detailed trace visibility
 }
 
 export interface RafieiCloudProject {
@@ -240,6 +251,7 @@ export interface DecisionJSON {
     summary: string;
     complexity: 'low' | 'medium' | 'high';
   };
+  narrative_summary: string; // Added this property
   backend_detection: {
     needs_backend: boolean;
     required_backend_features: string[];

@@ -3,7 +3,7 @@ import { useState, useEffect } from 'react';
 
 export type Language = 'en' | 'fa';
 
-const translations = {
+export const translations = {
   en: {
     // General
     appName: 'Rafiei Builder',
@@ -196,6 +196,10 @@ const translations = {
     projectInTrash: 'Project is in Trash',
     goToTrash: 'Go to Trash',
     projectUnavailable: 'Project Unavailable',
+    analysisTimedOut: 'Analysis timed out. Retrying with a simplified build plan...',
+    cloudConnectionCancelled: '🛑 Cloud connection cancelled.',
+    cloudConnectedAndResuming: "✅ **Rafiei Cloud Connected**\n\nDatabase is ready. Resuming your build request...",
+    cloudConnectionFailedError: "❌ Failed: {errorMessage}",
     
     // Chat
     startBuilding: 'Start building your dream app...',
@@ -205,6 +209,8 @@ const translations = {
     attemptFix: 'Attempt Fix',
     runtimeError: 'Runtime Error Detected',
     autoFixError: 'Auto-Fix Error',
+    retryBuild: 'Retry Build',
+    continueBuild: 'Continue Building',
 
     // Terminals
     buildFailed: 'Build Failed',
@@ -219,7 +225,7 @@ const translations = {
     backendReady: 'Backend ready. Resuming build...',
     connectionFailedTitle: 'Connection Failed',
     provisioningProject: 'Provisioning cloud project...',
-    wakingDatabase: 'Waking up database...',
+    wakingDatabase: 'Waking up & verifying database...',
     unknownError: 'An unknown error occurred.',
 
     // Domains
@@ -232,7 +238,58 @@ const translations = {
     configuration: 'Configuration',
     type: 'Type',
     value: 'Value',
-    primary: 'Primary'
+    primary: 'Primary',
+    
+    // Build Messages
+    initBuild: "Initiating build process...",
+    analyzingReq: "Analyzing request...",
+    preparingEnv: "Preparing environment...",
+    buildIntro: "Got it! I’m starting to build your project now.\nFirst, I’ll make sure the structure and UI are visible as quickly as possible.",
+    buildPlanTitle: "Here is the build plan:",
+    buildPhaseStart: "▶️ Starting Phase: {phaseTitle}",
+    buildStepStart: "🔧 {stepName}",
+    buildStepComplete: "✅ {stepName}",
+    buildFinalSummary: "🎉 Build completed successfully!\n\nHere’s what I built for you:\n• Fully rendered UI\n• Responsive layout\n• Navigation working\n\nYou can now:\n• Preview the app\n• Ask for changes\n• Add features",
+    buildWarning: "⚠️ I ran into a small issue while building.\nI’m trying to fix it automatically.{retryMsg}",
+    buildError: "❌ The build failed after several attempts.\n\n**Error:** {error}",
+    analyzingIntent: "Analyzing Intent...",
+    checkingRequirements: "Checking Requirements...",
+    planningPhases: "Planning Phases...",
+    designPhase: "Design",
+    designingUIUX: "Designing UI/UX...",
+    planningPhase: "Planning {phaseTitle}...",
+    generatingDBSchema: "Generating Database Schema...",
+    finalReview: "Final Review...",
+    applyingRepairs: "Applying Repairs...",
+
+    // New Build Steps
+    analyzingRequest: "Analyzing your request and planning the best approach...",
+    finishedAnalysis: "Finished analyzing your request.",
+    checkingBackend: "Checking for required backend services and data needs...",
+    backendActionRequired: "**Backend Required:** This project needs a database. Please connect to Rafiei Cloud to proceed.",
+    backendRequirementsMet: "Backend requirements analyzed and Rafiei Cloud is connected. Ready to proceed!",
+    backendSkipped: "Backend required but skipped by user. Proceeding with frontend-only implementation using mock data.",
+    noBackendNeeded: "No backend services or database needed. Proceeding with frontend-only build.",
+    creatingBuildPlan: "Creating a detailed build plan to ensure a smooth development process...",
+    planReady: "Here's the plan I've put together. I'll tackle this in phases, building piece by piece.",
+    startingDesign: "Starting the design phase: I'm crafting a beautiful and intuitive UI/UX for your app...",
+    generatingDesignSpec: "Generating design specification",
+    designComplete: "Design phase completed! Your app will have a modern, clean, and elegant aesthetic. Moving on to building the components.",
+    designSpecComplete: "Design specification complete",
+    startingPhase: "Starting phase: **{phaseTitle}**. I'm planning the technical steps for this part of your app.",
+    planningSteps: "Planning phase steps",
+    plannedSteps: "Planned steps for **{phaseTitle}**. Now, I'm building the actual code for this phase.",
+    executingSteps: "Executing build steps",
+    buildingPhase: "Building **{phaseTitle}**: Implementing `{filePath}`.",
+    phaseComplete: "Phase **{phaseTitle}** completed! All components and logic for this section are in place.",
+    allStepsComplete: "All steps complete",
+    generatingSchema: "Generating database schema and SQL migrations based on your requirements...",
+    schemaGenerated: "Database schema generated and saved to `supabase/schema.sql`. Ready for deployment!",
+    performingQA: "Performing final quality assurance and checking for any potential issues...",
+    qaDetectedIssues: "QA detected some issues. Automatically applying repairs: {narrative}",
+    repairsApplied: "Repairs applied. {narrative}",
+    qaPassed: "Final quality assurance passed with no issues detected. Your app looks great!",
+    buildAborted: "Build process aborted by user.",
   },
   fa: {
     // General
@@ -257,7 +314,7 @@ const translations = {
     ready: 'آماده‌اید چیزی شگفت‌انگیز بسازید؟',
     selectProject: 'انتخاب پروژه',
     saveConnect: 'ذخیره و اتصال',
-    disconnect: 'قطع اتصال',
+    disconnect: 'Disconnect',
     requiredSql: 'تنظیمات SQL مورد نیاز',
     managedCode: 'پیکربندی پایگاه داده از طریق کد مدیریت می‌شود.',
     configureGlobal: 'پیکربندی اتصال پایگاه داده جهانی.',
@@ -408,7 +465,7 @@ const translations = {
     buckets: 'سطل‌ها',
     createBucket: 'ایجاد سطل',
     deleteBucket: 'حذف سطل',
-    bucketEmpty: 'سطل خالی است',
+    bucketEmpty: 'Bucket is empty',
     rowsFetched: 'ردیف دریافت شد',
     noDataFound: 'داده‌ای در این جدول یافت نشد.',
     selectBucket: 'یک سطل را برای مشاهده فایل‌ها انتخاب کنید',
@@ -426,6 +483,10 @@ const translations = {
     projectInTrash: 'پروژه در زباله‌دان است',
     goToTrash: 'رفتن به زباله‌دان',
     projectUnavailable: 'پروژه در دسترس نیست',
+    analysisTimedOut: "زمان تحلیل به پایان رسید. در حال تلاش مجدد با یک برنامه ساخت ساده شده...",
+    cloudConnectionCancelled: "🛑 اتصال به ابر لغو شد.",
+    cloudConnectedAndResuming: "✅ **رفیعی کلود متصل شد**\n\nپایگاه داده آماده است. در حال از سرگیری درخواست ساخت شما...",
+    cloudConnectionFailedError: "❌ ناموفق: {errorMessage}",
     
     // Chat
     startBuilding: 'ساخت برنامه رویایی خود را شروع کنید...',
@@ -435,6 +496,8 @@ const translations = {
     attemptFix: 'تلاش برای تعمیر',
     runtimeError: 'خطای زمان اجرا شناسایی شد',
     autoFixError: 'تعمیر خودکار خطا',
+    retryBuild: 'تلاش مجدد ساخت',
+    continueBuild: 'ادامه ساخت',
 
     // Terminals
     buildFailed: 'ساخت ناموفق بود',
@@ -444,7 +507,7 @@ const translations = {
     selfHealing: 'حالت خود-تعمیری',
     analyzingReqs: 'تحلیل نیازمندی‌های پروژه...',
     retryJob: 'تلاش مجدد کار',
-    cloudConnected: 'متصل به ابر',
+    cloudConnected: 'ابر متصل شد',
     connectingCloud: 'در حال اتصال به رفیعی کلود',
     backendReady: 'بک‌اند آماده است. در حال ادامه ساخت...',
     connectionFailedTitle: 'اتصال ناموفق',
@@ -462,13 +525,66 @@ const translations = {
     configuration: 'پیکربندی',
     type: 'نوع',
     value: 'مقدار',
-    primary: 'اصلی'
+    primary: 'اصلی',
+
+    // Build Messages
+    initBuild: "آغاز فرآیند ساخت...",
+    analyzingReq: "تحلیل درخواست...",
+    preparingEnv: "آماده‌سازی محیط...",
+    buildIntro: "متوجه شدم! در حال ساخت پروژه شما هستم.\nابتدا، اطمینان حاصل می‌کنم که ساختار و رابط کاربری به سرعت قابل مشاهده باشند.",
+    buildPlanTitle: "این هم برنامه ساخت:",
+    buildPhaseStart: "▶️ شروع فاز: {phaseTitle}",
+    buildStepStart: "🔧 {stepName}",
+    buildStepComplete: "✅ {stepName}",
+    buildFinalSummary: "🎉 ساخت با موفقیت به پایان رسید!\n\nاین چیزی است که برای شما ساختم:\n• رابط کاربری کامل\n• طرح‌بندی واکنش‌گرا\n• ناوبری فعال\n\nشما اکنون می‌توانید:\n• پیش‌نمایش برنامه را ببینید\n• درخواست تغییرات کنید\n• ویژگی‌های جدید اضافه کنید",
+    buildWarning: "⚠️ هنگام ساخت با مشکل کوچکی مواجه شدم.\nدر حال تلاش برای رفع خودکار آن هستم.{retryMsg}",
+    buildError: "❌ ساخت پس از چندین تلاش ناموفق بود.\n\n**خطا:** {error}",
+    analyzingIntent: "تحلیل هدف...",
+    checkingRequirements: "بررسی نیازمندی‌ها...",
+    planningPhases: "برنامه‌ریزی فازها...",
+    designPhase: "طراحی",
+    designingUIUX: "طراحی رابط کاربری/تجربه کاربری...",
+    planningPhase: "برنامه‌ریزی {phaseTitle}...",
+    generatingDBSchema: "ایجاد اسکیمای پایگاه داده...",
+    finalReview: "بررسی نهایی...",
+    applyingRepairs: "اعمال تعمیرات...",
+
+    // New Build Steps
+    analyzingRequest: "در حال بررسی درخواست شما و برنامه‌ریزی بهترین روش...",
+    finishedAnalysis: "بررسی درخواست شما به پایان رسید.",
+    checkingBackend: "در حال بررسی نیازهای سرویس‌های بک‌اند و داده‌ها...",
+    backendActionRequired: "**نیاز به بک‌اند:** این پروژه به یک پایگاه داده نیاز دارد. لطفاً برای ادامه به رفیعی کلود متصل شوید.",
+    backendRequirementsMet: "نیازمندی‌های بک‌اند بررسی شد و رفیعی کلود متصل است. آماده ادامه!",
+    backendSkipped: "بک‌اند مورد نیاز بود اما توسط کاربر نادیده گرفته شد. ادامه ساخت فقط فرانت‌اند با داده‌های ساختگی.",
+    noBackendNeeded: "هیچ سرویس بک‌اند یا پایگاه داده‌ای مورد نیاز نیست. ادامه ساخت فقط فرانت‌اند.",
+    creatingBuildPlan: "در حال ایجاد یک برنامه ساخت دقیق برای اطمینان از روند توسعه روان...",
+    planReady: "این برنامه‌ای است که تنظیم کرده‌ام. من این کار را در چند فاز انجام خواهم داد و قطعه به قطعه می‌سازم.",
+    startingDesign: "شروع فاز طراحی: من در حال طراحی یک رابط کاربری/تجربه کاربری زیبا و بصری برای برنامه شما هستم...",
+    generatingDesignSpec: "تولید مشخصات طراحی",
+    designComplete: "فاز طراحی تکمیل شد! برنامه شما زیبایی‌شناسی مدرن، تمیز و شیکی خواهد داشت. رفتن به سراغ ساخت کامپوننت‌ها.",
+    designSpecComplete: "مشخصات طراحی تکمیل شد",
+    startingPhase: "شروع فاز: **{phaseTitle}**. من در حال برنامه‌ریزی مراحل فنی برای این بخش از برنامه شما هستم.",
+    planningSteps: "برنامه‌ریزی مراحل فاز",
+    plannedSteps: "مراحل برای **{phaseTitle}** برنامه‌ریزی شد. اکنون، من کد واقعی برای این فاز را می‌سازم.",
+    executingSteps: "اجرای مراحل ساخت",
+    buildingPhase: "در حال ساخت **{phaseTitle}**: پیاده‌سازی `{filePath}`.",
+    phaseComplete: "فاز **{phaseTitle}** تکمیل شد! تمام کامپوننت‌ها و منطق برای این بخش در جای خود قرار گرفتند.",
+    allStepsComplete: "تمام مراحل تکمیل شد",
+    generatingSchema: "در حال ایجاد اسکیمای پایگاه داده و مهاجرت‌های SQL بر اساس نیازمندی‌های شما...",
+    schemaGenerated: "اسکیمای پایگاه داده ایجاد و در `supabase/schema.sql` ذخیره شد. آماده استقرار!",
+    performingQA: "انجام تضمین کیفیت نهایی و بررسی هرگونه مشکل احتمالی...",
+    qaDetectedIssues: "تضمین کیفیت مشکلاتی را شناسایی کرد. اعمال خودکار تعمیرات: {narrative}",
+    repairsApplied: "تعمیرات اعمال شد. {narrative}",
+    qaPassed: "تضمین کیفیت نهایی بدون هیچ مشکلی انجام شد. برنامه شما عالی به نظر می‌رسد!",
+    buildAborted: "فرآیند ساخت توسط کاربر لغو شد.",
   }
 };
 
 // Global Event Bus for Language
 const listeners = new Set<(lang: Language) => void>();
 let currentLang: Language = 'en';
+
+export const getCurrentLanguage = (): Language => currentLang;
 
 export const setLanguage = (lang: Language) => {
   currentLang = lang;
@@ -493,7 +609,15 @@ export const useTranslation = () => {
   };
 
   return {
-    t: (key: keyof typeof translations['en']) => (translations[lang] || translations['en'] as any)[key] || key,
+    t: (key: keyof typeof translations['en'], vars?: Record<string, string>) => {
+      let str = (translations[lang] || translations['en'] as any)[key] || key;
+      if (vars) {
+        Object.entries(vars).forEach(([k, v]) => {
+          str = str.replace(`{${k}}`, v ?? '');
+        });
+      }
+      return str;
+    },
     dir: lang === 'fa' ? 'rtl' : 'ltr',
     lang,
     setLanguage,

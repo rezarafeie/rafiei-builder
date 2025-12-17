@@ -1,6 +1,6 @@
 
 import React, { useEffect, useRef, useState, useMemo } from 'react';
-import { GeneratedCode, ProjectFile } from '../types';
+import { GeneratedCode, ProjectFile, Project } from '../types';
 import { constructFullDocument } from '../utils/codeGenerator';
 import { Loader2, RefreshCw, Eye, ExternalLink } from 'lucide-react';
 
@@ -14,20 +14,8 @@ interface PreviewCanvasProps {
   projectId?: string; // Optional: Used for context-aware routing injection
   active?: boolean; // Optimization: Pause updates when hidden
   externalUrl?: string; // Optional: External deployment URL (Vercel)
+  project?: Project | null; // Pass full project for context injection
 }
-
-const loadingMessages = [
-  "Compiling pixels into a masterpiece...",
-  "Teaching components how to speak React...",
-  "Aligning divs and herding cats...",
-  "Polishing JSX until it shines...",
-  "Negotiating with the CSS specificity gods...",
-  "Warming up the AI's creativity cores...",
-  "Untangling the virtual wires of the DOM...",
-  "Assembling state and props into a symphony...",
-  "Brewing some fresh JavaScript...",
-  "Reticulating splines..."
-];
 
 const fixingMessages = [
   "Cooking up a fix...",
@@ -42,38 +30,33 @@ const fixingMessages = [
   "Re-calibrating the flux capacitor..."
 ];
 
-// Simple hash for content
-const hashCode = (s: string) => {
-    let h = 0, i = 0;
-    if (s.length > 0)
-        while (i < s.length)
-            h = (h << 5) - h + s.charCodeAt(i++) | 0;
-    return h;
-};
-
-const PreviewCanvas: React.FC<PreviewCanvasProps> = ({ code, files, className, isGenerating = false, isUpdating = false, onRuntimeError, projectId, active = true, externalUrl }) => {
+const PreviewCanvas: React.FC<PreviewCanvasProps> = ({ 
+    code, 
+    files, 
+    className, 
+    isGenerating = false, 
+    isUpdating = false, 
+    onRuntimeError, 
+    projectId, 
+    active = true, 
+    externalUrl,
+    project
+}) => {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [reloadKey, setReloadKey] = useState(0);
   const [hasRuntimeError, setHasRuntimeError] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [showErrorDetails, setShowErrorDetails] = useState(false);
   
-  // Memoize document string to prevent unnecessary iframe reloads
+  // Memoize document string matching Dashboard logic exactly
   const docString = useMemo(() => {
-      // Prioritize external URL if available and NOT generating
-      if (externalUrl && !isGenerating && !isUpdating) return null;
+    // If we are showing external URL, we don't need to generate the blob
+    if (externalUrl && !isGenerating && !isUpdating) return undefined;
 
-      if (files && files.length > 0) {
-          return constructFullDocument({ html: '', javascript: '', css: '', explanation: '' }, projectId, files);
-      }
-      if (code && (code.html || code.javascript)) {
-          return constructFullDocument(code, projectId);
-      }
-      return null;
-  }, [code, files, projectId, externalUrl, isGenerating, isUpdating]);
-
-  // Compute a content hash to force updates if content changes
-  const contentHash = useMemo(() => docString ? hashCode(docString) : 0, [docString]);
+    // Use strict fallback to ensure constructFullDocument always has data to work with
+    const codeData = code || { html: '', javascript: '', css: '', explanation: '' };
+    return constructFullDocument(codeData, projectId, files, project);
+  }, [code, files, projectId, externalUrl, isGenerating, isUpdating, project]);
 
   // Pick a random message when the error state changes
   const activeFixingMessage = useMemo(() => {
@@ -94,50 +77,28 @@ const PreviewCanvas: React.FC<PreviewCanvasProps> = ({ code, files, className, i
   }, [onRuntimeError]);
 
   useEffect(() => {
-    // Optimization: Skip updates if not active (e.g. hidden mobile tab)
-    if (!active) return;
-
-    // Reset error state and start loading
-    setHasRuntimeError(false);
-    setShowErrorDetails(false);
-    setIsLoading(true);
-
-    if (iframeRef.current) {
-        if (externalUrl && !isGenerating && !isUpdating) {
-            // USE VERCEL PREVIEW
-            if (iframeRef.current.src !== externalUrl) {
-                iframeRef.current.src = externalUrl;
-                iframeRef.current.removeAttribute('srcdoc');
-            } else {
-                setIsLoading(false); // Already on correct URL
-            }
-        } else if (docString) {
-            // USE LOCAL PREVIEW
-            iframeRef.current.srcdoc = docString;
-            iframeRef.current.removeAttribute('src');
-        } else if (isGenerating) {
-            iframeRef.current.srcdoc = `<!DOCTYPE html><html><body style="background:#0f172a;color:#94a3b8;display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;"><div>Building...</div></body></html>`;
-            iframeRef.current.removeAttribute('src');
-        } else {
-            iframeRef.current.srcdoc = `<!DOCTYPE html><html><body style="background:#f8fafc;display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;color:#64748b;"><div>Ready to Build</div></body></html>`;
-            iframeRef.current.removeAttribute('src');
-        }
-    }
-  }, [docString, isGenerating, isUpdating, reloadKey, active, contentHash, externalUrl]);
+      if ((isGenerating || isUpdating) && active) {
+          setIsLoading(true);
+          setHasRuntimeError(false);
+          setShowErrorDetails(false);
+      }
+  }, [isGenerating, isUpdating, active]);
 
   const handleReload = () => {
     setIsLoading(true);
-    if (iframeRef.current && externalUrl && !isGenerating) {
-        // Force reload of external URL by appending/changing timestamp
-        const url = new URL(externalUrl);
-        url.searchParams.set('t', Date.now().toString());
-        iframeRef.current.src = url.toString();
-    } else {
-        setReloadKey(prev => prev + 1);
-    }
+    setReloadKey(prev => prev + 1);
     setHasRuntimeError(false);
     setShowErrorDetails(false);
   };
+
+  // Optimization: If inactive (tab switched), unmount heavy iframe or return null
+  if (!active) return null;
+
+  // Determine iframe props
+  // 1. If external URL is active and we are NOT building, use `src`.
+  // 2. Otherwise use `srcDoc` with the generated HTML.
+  const srcProp = (externalUrl && !isGenerating && !isUpdating) ? externalUrl : undefined;
+  const srcDocProp = srcProp ? undefined : (docString || undefined);
 
   return (
     <div className={`w-full h-full bg-[#0f172a] rounded-lg overflow-hidden shadow-xl border border-gray-700 relative group ${className}`}>
@@ -193,11 +154,13 @@ const PreviewCanvas: React.FC<PreviewCanvasProps> = ({ code, files, className, i
 
       <iframe
         ref={iframeRef}
-        key={`${reloadKey}-${contentHash}`}
+        key={`${reloadKey}-${externalUrl || 'local'}`}
         title="App Preview"
         className="w-full h-full bg-white"
         sandbox="allow-scripts allow-modals allow-same-origin allow-forms allow-popups"
         loading="lazy"
+        src={srcProp}
+        srcDoc={srcDocProp}
         onLoad={() => setIsLoading(false)}
       />
       

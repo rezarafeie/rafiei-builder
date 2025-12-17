@@ -49,36 +49,38 @@ const CloudManagementPage: React.FC<CloudManagementPageProps> = ({ user }) => {
   // Users Tab State
   const [newUserEmail, setNewUserEmail] = useState('');
 
-  useEffect(() => {
-    const loadProject = async () => {
-        if (!projectId) return;
-        try {
-            const p = await cloudService.getProject(projectId);
-            if (p) {
-                setProject(p);
-                setCloudProject(p.rafieiCloudProject || null);
-            }
-        } catch (e) {
-            console.error(e);
-        } finally {
-            setLoading(false);
-        }
-    };
-    loadProject();
-  }, [projectId]);
-
   const fetchData = async () => {
-    if (!cloudProject) return;
-    setTabLoading(true);
+    // 1. Ensure projectId is available from route params
+    if (!projectId) {
+        setError("Project ID missing from URL.");
+        setLoading(false);
+        setTabLoading(false); 
+        return;
+    }
+
+    setTabLoading(true); 
     setError(null);
     setIsPaused(false);
     
     try {
-        const ref = cloudProject.projectRef;
-        const key = cloudProject.secretKey || '';
+        const latestProject = await cloudService.getProject(projectId);
+        if (!latestProject) {
+            throw new Error("Project not found in the database.");
+        }
+        
+        const latestCloudProject = latestProject.rafieiCloudProject || null;
+        if (!latestCloudProject || !latestCloudProject.projectRef) {
+             throw new Error("Rafiei Cloud project not found or not fully provisioned for this project. Status: " + (latestCloudProject?.status || 'N/A') + ". Please ensure it's active.");
+        }
+        
+        setProject(latestProject);
+        setCloudProject(latestCloudProject);
+
+        // Now we are guaranteed to have a valid `latestCloudProject` and `projectRef`
+        const ref = latestCloudProject.projectRef;
+        const key = latestCloudProject.secretKey || '';
 
         let result;
-        
         switch (activeTab) {
             case 'overview':
                 try {
@@ -114,23 +116,28 @@ const CloudManagementPage: React.FC<CloudManagementPageProps> = ({ user }) => {
                 result = await rafieiCloudService.getApiKeys(ref);
                 break;
             case 'logs':
-                result = [];
+                result = []; // Managed by ProjectLogModal, not fetched here directly
                 break;
         }
         setData(result);
-    } catch (err: any) {
-        console.error("Tab fetch failed", err);
-        const errMsg = err.message || "Failed to load data";
-        setError(errMsg);
+
+    } catch (e: any) {
+        console.error("Cloud Management Load Error:", e);
+        // Clean error message
+        let errMsg = e.message || "An unexpected error occurred.";
         if (errMsg.includes('ECONNREFUSED') || errMsg.includes('5432')) setIsPaused(true);
+        
+        setError(errMsg);
     } finally {
         setTabLoading(false);
+        setLoading(false);
     }
   };
 
   useEffect(() => {
+    // Trigger fetchData whenever activeTab or projectId changes
     fetchData();
-  }, [activeTab, cloudProject]);
+  }, [activeTab, projectId]); 
 
   // --- Database Actions ---
   const handleTableSelect = async (tableName: string) => {
@@ -246,7 +253,23 @@ const CloudManagementPage: React.FC<CloudManagementPageProps> = ({ user }) => {
   };
 
   if (loading) return <div className="h-screen flex items-center justify-center bg-[#0f172a] text-white"><Loader2 className="animate-spin" /></div>;
-  if (!project || !cloudProject) return <div className="h-screen flex items-center justify-center bg-[#0f172a] text-white">Project not found or not connected to Cloud.</div>;
+  if (!project) return (
+      <div className="h-screen flex flex-col items-center justify-center bg-[#0f172a] text-white gap-4">
+          <AlertTriangle size={48} className="text-red-500" />
+          <p className="text-lg">{error || "Project not found or not connected to Cloud."}</p>
+          <button onClick={() => navigate('/dashboard')} className="px-4 py-2 bg-slate-700 rounded-lg text-sm">Back to Dashboard</button>
+      </div>
+  );
+
+  // If we have a project but no cloud project (and encountered error), show partial UI or error state
+  if (!cloudProject) return (
+      <div className="h-screen flex flex-col items-center justify-center bg-[#0f172a] text-white gap-4">
+          <Cloud size={48} className="text-slate-600" />
+          <h2 className="text-xl font-bold">Cloud Not Active</h2>
+          <p className="text-slate-400 max-w-md text-center">{error}</p>
+          <button onClick={() => navigate(`/project/${projectId}`)} className="px-4 py-2 bg-indigo-600 rounded-lg text-sm font-medium">Return to Builder</button>
+      </div>
+  );
 
   const tabs: {id: TabId, label: string, icon: React.ReactNode}[] = [
       { id: 'overview', label: t('overview'), icon: <Cloud size={18} /> },
@@ -319,6 +342,15 @@ const CloudManagementPage: React.FC<CloudManagementPageProps> = ({ user }) => {
                         <h3 className="text-lg font-bold text-white">Project Paused</h3>
                         <p className="text-slate-400 max-w-md mt-2">The database is currently paused due to inactivity. Go to Overview or use the Supabase dashboard to wake it up.</p>
                      </div>
+                ) : error ? (
+                    <div className="flex flex-col items-center justify-center h-64 text-center">
+                        <AlertTriangle size={48} className="text-red-500 mb-4" />
+                        <h3 className="text-lg font-bold text-white">Error Loading Data</h3>
+                        <p className="text-slate-400 max-w-md mt-2">{error}</p>
+                        <button onClick={fetchData} className="mt-4 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg flex items-center gap-2">
+                            <RefreshCw size={16} /> Retry
+                        </button>
+                    </div>
                 ) : (
                     <div className="max-w-6xl mx-auto space-y-6">
                         {/* OVERVIEW */}

@@ -122,6 +122,10 @@ export const rafieiCloudService = {
                 region: 'us-east-1'
             });
 
+            if (!projectData || !projectData.id) {
+                throw new Error("Failed to receive valid project ID from Supabase API.");
+            }
+
             const newCloudProject: RafieiCloudProject = {
                 id: crypto.randomUUID(),
                 userId: user.id,
@@ -175,6 +179,10 @@ export const rafieiCloudService = {
                 region: 'us-east-1'
             });
 
+            if (!projectData || !projectData.id) {
+                throw new Error("Failed to receive valid project ID from Supabase API.");
+            }
+
             const newCloudProject: RafieiCloudProject = {
                 id: crypto.randomUUID(),
                 userId: user.id,
@@ -224,11 +232,11 @@ export const rafieiCloudService = {
         if (activeMonitors[cloudProject.id]) return; // Already monitoring
         activeMonitors[cloudProject.id] = true;
 
-        console.log(`[Background Job] Starting provisioning monitor for ${cloudProject.projectName}`);
+        console.log(`[Background Job] Starting provisioning monitor for ${cloudProject.projectName} (${cloudProject.projectRef})`);
 
         const startTime = Date.now();
-        const timeout = 300000; // 5 minutes
-        let currentStatus = cloudProject;
+        const timeout = 600000; // 10 minutes (Increased to account for cold starts/DNS)
+        let currentStatus = { ...cloudProject };
 
         try {
             while (Date.now() - startTime < timeout) {
@@ -238,58 +246,85 @@ export const rafieiCloudService = {
                     return;
                 }
 
-                // Check if we are done
-                if (currentStatus.status === 'ACTIVE' && currentStatus.secretKey) {
-                    // Check Data API availability
-                    const apiReady = await this.waitForPostgrest(currentStatus.projectRef, currentStatus.secretKey);
-                    if (apiReady) {
-                        
-                        // --- CRITICAL AUTH BOOTSTRAP ---
-                        // Before marking as fully ready, we must disable friction-based auth.
-                        try {
-                            await this.configureAuthDefaults(currentStatus.projectRef);
-                            console.log(`[Background Job] Auth defaults configured for ${currentStatus.projectName}.`);
-                        } catch (authError: any) {
-                             console.error(`[Background Job] Auth configuration failed:`, authError);
-                             throw new Error(`Auth bootstrap failed: ${authError.message}`);
-                        }
-                        // -------------------------------
-
-                        console.log(`[Background Job] Project ${currentStatus.projectName} is fully ready.`);
-                        break;
-                    }
-                }
-
-                // Wait 5 seconds
-                await new Promise(r => setTimeout(r, 5000));
-
                 // Sync status from Supabase Management API
+                // synced contains status='ACTIVE' if keys are found, BUT we don't trust it yet for the UI.
                 const synced = await this.syncProjectStatus(currentStatus);
                 
-                // If status changed or keys appeared, update DB
-                if (synced.status !== currentStatus.status || (!currentStatus.secretKey && synced.secretKey)) {
-                    currentStatus = synced;
+                // If keys appeared, update our local object
+                if (synced.secretKey) currentStatus.secretKey = synced.secretKey;
+                if (synced.publishableKey) currentStatus.publishableKey = synced.publishableKey;
+
+                // --- CHECK API READINESS (DNS & SERVER) ---
+                if (currentStatus.secretKey && currentStatus.publishableKey) {
+                    console.log(`[Background Job] Keys found. Verifying Data API Reachability...`);
                     
-                    // Update Cloud Table
-                    await cloudService.saveRafieiCloudProject(currentStatus);
+                    const apiReady = await this.waitForPostgrest(currentStatus.projectRef, currentStatus.secretKey);
                     
-                    // Update Main Project Table (to trigger UI subscriptions) - ONLY IF mainProjectId exists
-                    if (mainProjectId) {
-                        const mainProject = await cloudService.getProject(mainProjectId);
-                        if (mainProject) {
-                            await cloudService.saveProject({ ...mainProject, rafieiCloudProject: currentStatus });
+                    if (apiReady) {
+                        console.log(`[Background Job] Data API is ready. Configuring Auth...`);
+                        
+                        // --- CRITICAL AUTH BOOTSTRAP ---
+                        try {
+                            await this.configureAuthDefaults(currentStatus.projectRef);
+                            console.log(`[Background Job] Auth defaults configured.`);
+                        } catch (authError: any) {
+                             console.warn(`[Background Job] Auth config warning (non-fatal):`, authError);
                         }
+                        
+                        // --- SUCCESS STATE ---
+                        currentStatus.status = 'ACTIVE';
+                        
+                        // Save Final ACTIVE State
+                        await cloudService.saveRafieiCloudProject(currentStatus);
+                        if (mainProjectId) {
+                            const mainProject = await cloudService.getProject(mainProjectId);
+                            if (mainProject) {
+                                await cloudService.saveProject({ ...mainProject, rafieiCloudProject: currentStatus });
+                            }
+                        }
+
+                        console.log(`[Background Job] Project ${currentStatus.projectName} is fully active.`);
+                        break; // Exit loop
+                    } else {
+                        console.log(`[Background Job] Data API not reachable yet. Waiting for DNS propagation...`);
                     }
                 }
-                
-                // Stop if failed
-                if (currentStatus.status === 'FAILED') {
-                    throw new Error("Supabase reported project creation failed.");
+
+                // If keys are found but not ready yet, update DB with keys but KEEP status 'CREATING'
+                // This prevents UI from showing "Cloud Connected" prematurely.
+                if (currentStatus.secretKey && currentStatus.status !== 'ACTIVE') {
+                    // We save the keys so they persist, but we keep status CREATING so the UI shows spinner.
+                    const intermediateState = { ...currentStatus, status: 'CREATING' };
+                    await cloudService.saveRafieiCloudProject(intermediateState);
+                }
+
+                // Stop if Supabase reports failure explicitly
+                if (synced.status === 'FAILED') {
+                    throw new Error("Supabase reported project creation failed (FAILED status).");
+                }
+
+                // Wait 10 seconds before next check
+                await new Promise(r => setTimeout(r, 10000));
+            }
+
+            // Timeout Handling
+            if (Date.now() - startTime >= timeout) {
+                throw new Error("Provisioning timed out. The project took too long to become reachable.");
+            }
+
+        } catch (error: any) {
+            console.error(`[Background Job] Monitoring failed:`, error);
+            
+            // Update DB with Error State so UI doesn't hang forever
+            currentStatus.status = 'FAILED';
+            await cloudService.saveRafieiCloudProject(currentStatus);
+            if (mainProjectId) {
+                const mainProject = await cloudService.getProject(mainProjectId);
+                if (mainProject) {
+                    await cloudService.saveProject({ ...mainProject, rafieiCloudProject: currentStatus });
                 }
             }
-        } catch (error) {
-            console.error(`[Background Job] Monitoring failed:`, error);
-            // Optionally update DB with error state, but 'CREATING' usually implies retry-able
+
         } finally {
             delete activeMonitors[cloudProject.id];
         }
@@ -303,6 +338,8 @@ export const rafieiCloudService = {
     async checkInfrastructureHealth(projectRef: string): Promise<boolean> {
         try {
             const health = await requestManagement(`/projects/${projectRef}/health?services=db&services=auth`, 'GET');
+            if (!Array.isArray(health)) return false;
+            
             const dbHealthy = health.find((s: any) => s.name === 'db')?.status === 'ACTIVE_HEALTHY';
             const authHealthy = health.find((s: any) => s.name === 'auth')?.status === 'ACTIVE_HEALTHY';
             return dbHealthy && authHealthy;
@@ -317,21 +354,33 @@ export const rafieiCloudService = {
     async waitForPostgrest(projectRef: string, apiKey: string): Promise<boolean> {
         // Quick check
         try {
+            // Using AbortController to enforce timeout on the fetch itself
+            const controller = new AbortController();
+            const id = setTimeout(() => controller.abort(), 5000);
+            
             const res = await fetch(`https://${projectRef}.supabase.co/rest/v1/`, {
                 method: 'GET',
-                headers: { 'apikey': apiKey }
+                headers: { 'apikey': apiKey },
+                signal: controller.signal
             });
+            
+            clearTimeout(id);
+            
+            // PostgREST root usually returns documentation or 200 OK
             if (res.ok) return true;
-        } catch (e) {}
+        } catch (e) {
+            // Network error (DNS, connection refused, timeout)
+        }
         return false;
     },
 
     async syncProjectStatus(project: RafieiCloudProject): Promise<RafieiCloudProject> {
+        // If we are already fully configured locally, just return.
         if (project.status === 'ACTIVE' && project.publishableKey && project.secretKey) return project;
 
         // 1. Check Infra Health
         const isHealthy = await this.checkInfrastructureHealth(project.projectRef);
-        if (!isHealthy) return project;
+        if (!isHealthy) return project; // Still provisioning infra
 
         // 2. Fetch Keys
         try {
@@ -343,7 +392,8 @@ export const rafieiCloudService = {
             if (anonKey && serviceKey) {
                 return {
                     ...project,
-                    status: 'ACTIVE',
+                    // Note: We return ACTIVE here as 'platform status', but monitorProvisioning decides when to persist it
+                    status: 'ACTIVE', 
                     publishableKey: anonKey,
                     secretKey: serviceKey
                 };

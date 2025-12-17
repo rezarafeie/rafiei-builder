@@ -1,4 +1,3 @@
-
 import { ProjectFile } from '../types';
 
 interface GitHubTreeItem {
@@ -121,8 +120,10 @@ export const githubService = {
                     type: 'file',
                     language: this.detectLanguage(item.path)
                 });
-            } catch (e: any) {
-                throw new Error(`Failed to import ${item.path}: ${e.message}`);
+            } catch (e: unknown) {
+                // Safely extract message from unknown error
+                const errorMessage = e instanceof Error ? e.message : String(e);
+                throw new Error(`Failed to import ${item.path}: ${errorMessage}`);
             } finally {
                 completed++;
                 if (onProgress) onProgress(`Importing ${item.path}...`, 10 + Math.round((completed / totalFiles) * 80));

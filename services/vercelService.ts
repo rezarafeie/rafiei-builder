@@ -48,12 +48,18 @@ export const vercelService = {
             };
         }
 
-        const slug = project.name
+        // Sanitize project name to be a valid slug
+        let slug = project.name
             .toLowerCase()
-            .replace(/[^a-z0-9]/g, '-')
-            .replace(/-+/g, '-')
-            .replace(/^-|-$/g, '')
-            .substring(0, 50);
+            .replace(/[^a-z0-9]/g, '-') // Replace non-alphanumeric with hyphen
+            .replace(/-+/g, '-')       // Collapse multiple hyphens
+            .replace(/^-|-$/g, '')       // Trim leading/trailing hyphens
+            .substring(0, 45);          // Max length for slug part
+
+        // If slug is empty after sanitization (e.g., name was "!!"), use a default prefix.
+        if (!slug) {
+            slug = 'project';
+        }
             
         const uniqueName = `${slug}-${project.id.substring(0, 6)}`;
 
@@ -64,12 +70,22 @@ export const vercelService = {
             });
             return { id: res.id, name: res.name };
         } catch (e: any) {
-            // Check if exists
-            if (e.message.includes('already exists')) {
-                // If we don't have the ID but name conflict exists, try fetching
-                // For simplicity, let's append random string and retry once if needed in a real scenario
-                throw new Error("Project name conflict on Vercel. Please rename your project locally.");
+            // If project with that name already exists, find it and return its ID.
+            if (e.message && (e.message.includes('already exists') || e.message.includes('already taken'))) {
+                console.log(`Vercel project '${uniqueName}' already exists. Fetching its ID directly.`);
+                try {
+                    // Use direct fetch by name, which is more reliable than search.
+                    const existingProject = await api(`/v9/projects/${uniqueName}`, 'GET');
+                    if (existingProject && existingProject.id) {
+                        console.log(`Found existing project with ID: ${existingProject.id}`);
+                        return { id: existingProject.id, name: existingProject.name };
+                    }
+                    throw new Error(`Project name conflict for '${uniqueName}', but could not fetch the existing project directly.`);
+                } catch (findErr: any) {
+                    throw new Error(`Failed to resolve Vercel project conflict for '${uniqueName}': ${findErr.message}`);
+                }
             }
+            // Re-throw other errors
             throw e;
         }
     },
@@ -108,10 +124,15 @@ export const vercelService = {
         try {
             return await api(`/v10/projects/${projectId}/domains`, 'POST', { name: domain });
         } catch (e: any) {
-            // Ignore if already exists
-            if (!e.message.includes('already exists')) {
-                console.warn(`Failed to assign domain ${domain}:`, e);
+            // Ignore errors indicating the domain is already configured. This is expected on updates.
+            const msg = e.message.toLowerCase();
+            if (msg.includes('already exists') || msg.includes('already in use')) {
+                console.log(`Domain ${domain} already assigned, which is expected. Continuing.`);
+                return; // Suppress the error and continue.
             }
+            // Re-throw unexpected errors.
+            console.error(`Failed to assign domain ${domain}:`, e);
+            throw e;
         }
     },
 

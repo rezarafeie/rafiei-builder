@@ -150,7 +150,7 @@ const ProjectCard = React.memo(({ project, view, actionId, onSoftDelete, onResto
             to={view === 'active' ? `/project/${project.id}` : '#'}
             className={`group flex flex-col gap-3 p-1 ${actionId === project.id ? 'opacity-50 pointer-events-none' : ''}`}
         >
-            <div ref={ref} className="relative aspect-[16/10] bg-white dark:bg-[#1e293b] rounded-xl overflow-hidden border border-slate-200 dark:border-slate-800 group-hover:border-slate-400 dark:group-hover:border-slate-600 transition-all shadow-sm group-hover:shadow-lg">
+            <div ref={ref} className="relative aspect-[16/10] bg-white dark:bg-[#1e293b] rounded-xl overflow-hidden border border-slate-200 dark:border-slate-800 group-hover:border-slate-400 dark:group-hover:border-slate-600 transition-all shadow-sm group-hover:shadow-lg" dir="ltr">
                 {srcDoc ? (
                     <div className="absolute inset-0 w-[400%] h-[400%] origin-top-left transform scale-[0.25] pointer-events-none select-none bg-white">
                         <iframe 
@@ -160,7 +160,7 @@ const ProjectCard = React.memo(({ project, view, actionId, onSoftDelete, onResto
                             scrolling="no"
                             loading="lazy"
                             title={`Preview of ${project.name}`}
-                            sandbox="allow-scripts" 
+                            sandbox="allow-scripts allow-modals allow-same-origin allow-forms allow-popups" 
                         />
                     </div>
                 ) : (
@@ -210,7 +210,7 @@ const ProjectCard = React.memo(({ project, view, actionId, onSoftDelete, onResto
             <div className="flex items-start justify-between px-1">
                 <div className="flex items-center gap-3 min-w-0">
                     <div className="w-8 h-8 rounded-full bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 flex items-center justify-center text-xs font-bold border border-indigo-100 dark:border-indigo-500/20 shrink-0">
-                        {user.avatar ? <img src={user.avatar} className="w-full h-full rounded-full object-cover" /> : user.name.charAt(0).toUpperCase()}
+                        {user.avatar ? <img src={user.avatar} className="w-full h-full object-cover" /> : user.name.charAt(0).toUpperCase()}
                     </div>
                     <div className="min-w-0">
                         <h3 className="text-sm font-medium text-slate-700 dark:text-slate-300 group-hover:text-indigo-600 dark:group-hover:text-white transition-colors truncate pr-2">{project.name}</h3>
@@ -453,7 +453,7 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onLogout, view }) => {
   const isAdmin = user.isAdmin || user.email === 'rezarafeie13@gmail.com';
 
   return (
-    <div className="min-h-screen bg-slate-50 dark:bg-[#020617] text-slate-800 dark:text-slate-200 font-sans selection:bg-indigo-500/30 pb-20 transition-colors duration-300" dir={dir}>
+    <div className="min-h-screen bg-slate-50 dark:bg-[#020617] text-slate-800 dark:text-slate-200 font-sans selection:bg-indigo-500/30 pb-20 transition-colors duration-300 overflow-x-hidden" dir={dir}>
         {showImportModal && (
             <GitHubImportModal 
                 onClose={() => setShowImportModal(false)}
@@ -542,7 +542,7 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onLogout, view }) => {
                         <div className="w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center text-white text-xs font-bold overflow-hidden border-2 border-white dark:border-slate-800 shadow-md">
                             {user.avatar ? <img src={user.avatar} alt="avatar" className="w-full h-full object-cover"/> : user.name.charAt(0).toUpperCase()}
                         </div>
-                        <div className="absolute top-full right-0 mt-2 w-32 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg shadow-xl p-1 opacity-0 group-hover:opacity-100 invisible group-hover:visible transition-all duration-200 z-50">
+                        <div className="absolute top-full right-0 rtl:right-auto rtl:left-0 mt-2 w-32 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg shadow-xl p-1 opacity-0 group-hover:opacity-100 invisible group-hover:visible transition-all duration-200 z-50">
                             <button onClick={() => setShowCreditModal(true)} className="w-full text-left px-3 py-2 text-xs text-slate-600 dark:text-slate-300 hover:text-indigo-600 dark:hover:text-white hover:bg-slate-50 dark:hover:bg-slate-700 rounded flex items-center gap-2">
                                 <Wallet size={12} /> {t('manageCredits')}
                             </button>

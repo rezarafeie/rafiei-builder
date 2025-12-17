@@ -1,6 +1,7 @@
 
+
 import React, { useState } from 'react';
-import { Project, User } from '../types';
+import { Project, User, VercelConfig } from '../types';
 import { useTranslation } from '../utils/translations';
 import { Globe, Users, Copy, ExternalLink, Star, Check, Loader2, Rocket, RefreshCw, AlertTriangle } from 'lucide-react';
 import { vercelService } from '../services/vercelService';
@@ -12,15 +13,15 @@ interface PublishDropdownProps {
   onManageDomains: () => void;
   onClose: () => void;
   onUpdate: () => void;
+  onDeployStart: () => void; // New prop
+  onDeployComplete: (vercelConfig: VercelConfig | null, error: string | null) => void; // New prop
 }
 
-const PublishDropdown: React.FC<PublishDropdownProps> = ({ project, onManageDomains }) => {
+const PublishDropdown: React.FC<PublishDropdownProps> = ({ project, onManageDomains, onDeployStart, onDeployComplete }) => {
     const { t, dir } = useTranslation();
     const [copied, setCopied] = useState(false);
     
-    // Deployment State
-    const [isDeploying, setIsDeploying] = useState(false);
-    const [deployStatus, setDeployStatus] = useState<string | null>(null);
+    // Deployment State (kept local for immediate feedback only, main status handled by parent)
     const [deployError, setDeployError] = useState<string | null>(null);
 
     // Calculate dynamic preview URL (Cloud Run - Internal)
@@ -47,31 +48,25 @@ const PublishDropdown: React.FC<PublishDropdownProps> = ({ project, onManageDoma
             return;
         }
 
-        setIsDeploying(true);
+        onDeployStart(); // Notify parent that deployment has started
         setDeployError(null);
-        setDeployStatus("Preparing snapshot...");
 
         try {
             // 1. Create/Get Vercel Project
-            setDeployStatus("Initializing Vercel project...");
-            // Optimistic update for UI feedback
             const vercelConfig = await vercelService.publishProject(project);
             
             // 2. Save new config to database
-            setDeployStatus("Finalizing...");
             const updatedProject = { ...project, vercelConfig };
             await cloudService.saveProject(updatedProject);
             
-            setDeployStatus("Done!");
-            setTimeout(() => {
-                setIsDeploying(false);
-                setDeployStatus(null);
-            }, 1000);
+            // Notify parent about completion (success)
+            onDeployComplete(vercelConfig, null);
 
         } catch (e: any) {
             console.error("Deploy Failed", e);
             setDeployError(e.message || "Deployment failed");
-            setIsDeploying(false);
+            // Notify parent about completion (failure)
+            onDeployComplete(null, e.message || "Deployment failed");
         }
     };
 
@@ -99,20 +94,14 @@ const PublishDropdown: React.FC<PublishDropdownProps> = ({ project, onManageDoma
 
             {/* Primary Action Button */}
             <div className="mb-4">
-                {isDeploying ? (
-                    <div className="w-full bg-slate-100 dark:bg-slate-800 rounded-lg p-3 flex items-center justify-center gap-3 text-sm text-slate-600 dark:text-slate-300">
-                        <Loader2 className="animate-spin text-indigo-500" size={18} />
-                        <span>{deployStatus}</span>
-                    </div>
-                ) : (
-                    <button 
-                        onClick={handlePublish}
-                        className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2.5 rounded-lg transition-all shadow-md hover:shadow-lg flex items-center justify-center gap-2"
-                    >
-                        {project.vercelConfig ? <RefreshCw size={18} /> : <Rocket size={18} />}
-                        {project.vercelConfig ? "Update Deployment" : "Publish to Web"}
-                    </button>
-                )}
+                {/* Disable button if parent says it's deploying */}
+                <button 
+                    onClick={handlePublish}
+                    className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2.5 rounded-lg transition-all shadow-md hover:shadow-lg flex items-center justify-center gap-2"
+                >
+                    {project.vercelConfig ? <RefreshCw size={18} /> : <Rocket size={18} />}
+                    {project.vercelConfig ? "Update Deployment" : "Publish to Web"}
+                </button>
                 
                 {deployError && (
                     <div className="mt-2 text-xs text-red-500 bg-red-50 dark:bg-red-900/20 p-2 rounded border border-red-100 dark:border-red-900/30 flex items-start gap-2">
@@ -121,7 +110,7 @@ const PublishDropdown: React.FC<PublishDropdownProps> = ({ project, onManageDoma
                     </div>
                 )}
                 
-                {lastDeployed && !isDeploying && (
+                {lastDeployed && (
                     <div className="text-[10px] text-center text-slate-400 mt-2">
                         Last updated: {lastDeployed}
                     </div>

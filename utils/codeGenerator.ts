@@ -1,398 +1,580 @@
 
-import { GeneratedCode, ProjectFile } from "../types";
+import { GeneratedCode, ProjectFile, Project } from "../types";
+import { getCurrentLanguage } from './translations';
 
-export const constructFullDocument = (code: GeneratedCode, projectId?: string, files?: ProjectFile[]): string => {
-  if (files && files.length > 0) {
-    return constructMultiFileDocument(files, projectId);
-  }
-  return constructSingleFileDocument(code, projectId);
+// Silence false positive for 'require' inside template strings if parsed incorrectly
+declare var require: any;
+
+// --- CONSTANTS & TEMPLATES ---
+
+const DEFAULT_MAIN_TSX = `
+import React from "react";
+import { createRoot } from "react-dom/client";
+import App from "./App";
+import "./index.css";
+
+const el = document.getElementById("root");
+if (el) {
+  createRoot(el).render(
+    <React.StrictMode>
+      <App />
+    </React.StrictMode>
+  );
+} else {
+  console.error("Critical: #root element missing in index.html");
+}
+`.trim();
+
+const DEFAULT_APP_TSX = `
+import React from "react";
+
+export default function App() {
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-slate-50 text-slate-900">
+      <div className="p-8 rounded-2xl shadow bg-white">
+        <h1 className="text-3xl font-bold">Hello World</h1>
+        <p className="mt-2 text-slate-600">Preview is ready.</p>
+      </div>
+    </div>
+  );
+}
+`.trim();
+
+const DEFAULT_INDEX_CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Vazirmatn:wght@400;500;600;700&display=swap');
+body { 
+  font-family: 'Vazirmatn', 'Inter', system-ui, -apple-system, sans-serif; 
+  margin: 0;
+  padding: 0;
+}
+`.trim();
+
+const DEFAULT_INDEX_HTML = `<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>App</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            fontFamily: {
+              sans: ['Vazirmatn', 'Inter', 'sans-serif'],
+            }
+          }
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>`;
+
+// --- SANITIZATION HELPERS ---
+
+const stripMarkdownFences = (content: string): string => {
+    if (!content) return "";
+    let clean = content.trim();
+    
+    // Remove wrapping ```...``` with optional language tag
+    // This regex matches: start of string, optional whitespace, ```, optional lang chars, optional newline, (GROUP: content), ```, optional whitespace, end of string
+    const match = clean.match(/^[\s\n]*```(?:[\w-]*)\n?([\s\S]*?)```[\s\n]*$/);
+    if (match) return match[1].trim();
+    
+    // Fallback: Remove leading ``` (and optional lang) if present
+    clean = clean.replace(/^```[\w-]*\n?/, '');
+    
+    // Fallback: Remove trailing ``` if present
+    clean = clean.replace(/\n?```$/, '');
+    
+    return clean.trim();
 };
 
-export const constructMultiFileDocument = (files: ProjectFile[], projectId?: string): string => {
+const decodeEscapes = (content: string): string => {
+    let clean = content;
+    
+    // If it looks like a JSON string literal (wrapped in quotes), try to parse it first
+    if (clean.length > 2 && clean.startsWith('"') && clean.endsWith('"')) {
+        try {
+            const parsed = JSON.parse(clean);
+            if (typeof parsed === 'string') return parsed;
+        } catch (e) {
+            // If parse fails, fall back to manual replacement
+        }
+    }
+
+    // Manual un-escaping for common patterns
+    if (clean.includes('\\n')) clean = clean.replace(/\\n/g, '\n');
+    if (clean.includes('\\t')) clean = clean.replace(/\\t/g, '\t');
+    if (clean.includes('\\"')) clean = clean.replace(/\\"/g, '"');
+    if (clean.includes("\\'")) clean = clean.replace(/\\'/g, "'");
+    if (clean.includes('\\\\')) clean = clean.replace(/\\\\/g, '\\');
+    
+    return clean;
+};
+
+const removeTailwindDirectives = (content: string): string => {
+    return content
+        .split('\n')
+        .filter(line => !line.trim().startsWith('@tailwind'))
+        .join('\n');
+};
+
+export const sanitizeFileContent = (content: string, path: string): string => {
+    if (!content) return "";
+    let clean = content;
+
+    // 1. Strip Markdown Fences (CRITICAL: Must happen first)
+    clean = stripMarkdownFences(clean);
+
+    // 2. Decode Escapes
+    // If the content still has literal newlines or escaped quotes, it's likely double-escaped.
+    // We check for \n or \" to trigger decoding.
+    if (clean.includes('\\n') || clean.includes('\\"')) {
+        clean = decodeEscapes(clean);
+    }
+
+    // 3. HTML Entity Decoding for Code Files
+    // AI sometimes returns &lt; instead of < in code blocks
+    if (path.match(/\.(tsx|jsx|ts|js|html|css|json|md)$/)) {
+        if (clean.includes('&lt;') || clean.includes('&gt;') || clean.includes('&amp;')) {
+            clean = clean
+                .replace(/&lt;/g, '<')
+                .replace(/&gt;/g, '>')
+                .replace(/&amp;/g, '&')
+                .replace(/&quot;/g, '"')
+                .replace(/&#39;/g, "'");
+        }
+    }
+
+    // 4. CSS Specific cleanup
+    if (path.endsWith('.css')) {
+        clean = removeTailwindDirectives(clean);
+    }
+
+    return clean.trim();
+};
+
+export const validateProjectSafety = (files: ProjectFile[]): string | null => {
+    for (const f of files) {
+        if (f.content.includes('```')) {
+            return `Sanitization Failed: File '${f.path}' still contains Markdown fences.`;
+        }
+        if (f.content.includes('[object Object]')) {
+            return `Sanitization Failed: File '${f.path}' contains '[object Object]'.`;
+        }
+    }
+    return null;
+};
+
+// --- NORMALIZATION & REPAIR ---
+
+export const normalizeFiles = (files: ProjectFile[]): { files: ProjectFile[], entryPoint: string | null } => {
+    const fileMap = new Map<string, ProjectFile>();
+    let entryPoint: string | null = null;
+
+    // 1. Ingest and Canonicalize Paths
+    files.forEach(f => {
+        let path = f.path.trim().replace(/^\.\//, '').replace(/^\//, '');
+        
+        // Force critical files to src/
+        if (['main.tsx', 'main.jsx', 'index.tsx', 'index.jsx'].includes(path)) path = 'src/main.tsx';
+        if (['App.tsx', 'App.jsx', 'app.tsx'].includes(path)) path = 'src/App.tsx';
+        if (['index.css', 'styles.css'].includes(path)) path = 'src/index.css';
+
+        // General src enforcement for code
+        if ((path.endsWith('.tsx') || path.endsWith('.ts') || path.endsWith('.css')) && 
+            !path.startsWith('src/') && 
+            !path.includes('config') && 
+            !path.includes('.d.ts')) {
+            path = `src/${path}`;
+        }
+
+        // Sanitize content immediately
+        const content = sanitizeFileContent(f.content, path);
+
+        fileMap.set(path, { ...f, path, content });
+    });
+
+    // 2. Determine Entry Point & Mode
+    // We prioritize TSX over JSX
+    if (fileMap.has('src/main.tsx')) entryPoint = 'src/main.tsx';
+    else if (fileMap.has('src/index.tsx')) entryPoint = 'src/index.tsx';
+    else if (fileMap.has('src/main.jsx')) entryPoint = 'src/main.jsx';
+    else if (fileMap.has('src/index.jsx')) entryPoint = 'src/index.jsx';
+
+    // 3. Validate & Repair React Entry Point
+    if (entryPoint) {
+        const mainFile = fileMap.get(entryPoint);
+        // Repair main.tsx if it doesn't look like a valid entry
+        if (!mainFile || !mainFile.content.includes('createRoot') || !mainFile.content.includes('.render(')) {
+            console.warn("Repairing invalid entry point:", entryPoint);
+            fileMap.set(entryPoint, { 
+                path: entryPoint, 
+                content: DEFAULT_MAIN_TSX, 
+                type: 'file', 
+                language: 'typescript' 
+            });
+        }
+
+        // Ensure App.tsx exists if we have an entry point
+        const appFile = fileMap.get('src/App.tsx') || fileMap.get('src/App.jsx');
+        if (!appFile || appFile.content.trim().length < 20) {
+             console.warn("Repairing missing/empty App.tsx");
+             fileMap.set('src/App.tsx', {
+                 path: 'src/App.tsx', 
+                 content: DEFAULT_APP_TSX, 
+                 type: 'file', 
+                 language: 'typescript' 
+             });
+        }
+        
+        // Ensure index.html exists, but FORCE it to be the default shell for React apps
+        // Rule 4: "The preview iframe MUST always load a single static HTML shell."
+        fileMap.set('index.html', {
+            path: 'index.html',
+            content: DEFAULT_INDEX_HTML,
+            type: 'file',
+            language: 'html'
+        });
+    } else {
+        // Static Mode (No JS Entry): Validate index.html
+        const htmlFile = fileMap.get('index.html');
+        let isValidHtml = false;
+
+        if (htmlFile && htmlFile.content) {
+            const trimmed = htmlFile.content.trim();
+            // Strict check for HTML content
+            const startsWithTag = trimmed.startsWith('<');
+            const hasHtmlTags = trimmed.toLowerCase().includes('<html') && trimmed.toLowerCase().includes('<body');
+            isValidHtml = startsWithTag && hasHtmlTags;
+        }
+
+        if (!isValidHtml) {
+            // If no valid HTML and no entry point, we have nothing. 
+            // Fallback to React Skeleton.
+            entryPoint = 'src/main.tsx';
+            fileMap.set('src/main.tsx', { path: 'src/main.tsx', content: DEFAULT_MAIN_TSX, type: 'file', language: 'typescript' });
+            fileMap.set('src/App.tsx', { path: 'src/App.tsx', content: DEFAULT_APP_TSX, type: 'file', language: 'typescript' });
+            fileMap.set('index.html', { path: 'index.html', content: DEFAULT_INDEX_HTML, type: 'file', language: 'html' });
+        }
+    }
+
+    // 4. Validate src/index.css
+    if (!fileMap.has('src/index.css')) {
+        fileMap.set('src/index.css', {
+            path: 'src/index.css', 
+            content: DEFAULT_INDEX_CSS, 
+            type: 'file', 
+            language: 'css' 
+        });
+    }
+
+    return { files: Array.from(fileMap.values()), entryPoint };
+};
+
+// --- SAFE JSON SERIALIZER ---
+const safeJsonStringify = (obj: any): string => {
+    return JSON.stringify(obj)
+        .replace(/</g, '\\u003c')
+        .replace(/>/g, '\\u003e')
+        .replace(/\u2028/g, '\\u2028')
+        .replace(/\u2029/g, '\\u2029');
+};
+
+// --- DOCUMENT CONSTRUCTION ---
+
+export const constructFullDocument = (code: GeneratedCode, projectId?: string, files?: ProjectFile[], project?: Project | null): string => {
+    // Merge code prop into files if needed to form a complete set
+    let allFiles = files ? [...files] : [];
+    
+    // Only use code snippets if files array is empty/insufficient
+    if (allFiles.length === 0 && (code.javascript || code.html)) {
+        if (code.javascript) allFiles.push({ path: 'src/App.tsx', content: code.javascript, type: 'file' });
+        if (code.css) allFiles.push({ path: 'src/index.css', content: code.css, type: 'file' });
+        if (code.html) allFiles.push({ path: 'index.html', content: code.html, type: 'file' });
+    }
+
+    return constructMultiFileDocument(allFiles, projectId, project);
+};
+
+export const constructMultiFileDocument = (rawFiles: ProjectFile[], projectId?: string, project?: Project | null): string => {
+  const appLang = getCurrentLanguage();
+  const appDir = appLang === 'fa' ? 'rtl' : 'ltr';
+
+  // 1. Normalize, Sanitize, Repair
+  const { files: processedFiles, entryPoint } = normalizeFiles(rawFiles);
+
+  // 2. Safety Check
+  const safetyError = validateProjectSafety(processedFiles);
+  if (safetyError) {
+      return `<!DOCTYPE html><html><body style="background:#0f172a;color:#ef4444;display:flex;align-items:center;justify-content:center;height:100vh;padding:2rem;"><div style="text-align:center"><h3 style="margin-bottom:10px">Security Block</h3><pre>${safetyError}</pre></div></body></html>`;
+  }
+
+  // 3. Construct HTML Shell
+  // Rule 4: If React entry exists, use strict shell. Otherwise use processed index.html.
+  const indexHtml = processedFiles.find(f => f.path === 'index.html')!;
+  let baseHtmlContent = indexHtml.content;
+
+  // Ensure HTML tag
+  if (!baseHtmlContent.toLowerCase().includes('<html')) {
+      baseHtmlContent = `<!DOCTYPE html><html>${baseHtmlContent}</html>`;
+  } else if (!baseHtmlContent.includes('<!DOCTYPE html')) {
+      baseHtmlContent = `<!DOCTYPE html>${baseHtmlContent}`;
+  }
+
+  // Inject lang/dir
+  baseHtmlContent = baseHtmlContent.replace(/<html[^>]*>/i, (match) => {
+    let tag = match;
+    if (!tag.includes('lang=')) tag = tag.replace('<html', `<html lang="${appLang}"`);
+    if (!tag.includes('dir=')) tag = tag.replace('<html', `<html dir="${appDir}"`);
+    return tag;
+  });
+
+  // Remove existing scripts that might conflict
+  baseHtmlContent = baseHtmlContent.replace(/<script[^>]*type="module"[^>]*src=".*?"[\s\S]*?<\/script>/g, '');
+  baseHtmlContent = baseHtmlContent.replace(/<script[^>]*type="importmap"[\s\S]*?<\/script>/g, '');
+
+  // 4. Inject Environment Variables
   const projectIdInjection = projectId ? `window.__PROJECT_ID__ = "${projectId}";` : 'window.__PROJECT_ID__ = null;';
   
-  // 1. Precise Entry Point Detection
-  let entryFile = files.find(f => 
-    f.path === 'src/main.tsx' || 
-    f.path === 'src/index.tsx' || 
-    f.path === 'src/main.jsx' || 
-    f.path === 'src/index.jsx' ||
-    f.path === 'main.tsx' ||
-    f.path === 'index.tsx'
-  );
+  let envInjection = `
+      window.process = { 
+          env: { 
+              NODE_ENV: 'development',
+          } 
+      };
+  `;
 
-  // 2. Fallback: Search for reasonable alternatives
-  if (!entryFile) {
-      entryFile = files.find(f => f.path.endsWith('src/App.tsx') || f.path.endsWith('App.tsx'));
+  // Inject Supabase Credentials if Active
+  if (project?.rafieiCloudProject?.status === 'ACTIVE' && project.rafieiCloudProject.projectRef && project.rafieiCloudProject.publishableKey) {
+      const url = `https://${project.rafieiCloudProject.projectRef}.supabase.co`;
+      const key = project.rafieiCloudProject.publishableKey;
+      envInjection = `
+          window.process = { 
+              env: { 
+                  NODE_ENV: 'development',
+                  SUPABASE_URL: '${url}',
+                  SUPABASE_ANON_KEY: '${key}',
+                  VITE_SUPABASE_URL: '${url}',
+                  VITE_SUPABASE_ANON_KEY: '${key}',
+                  NEXT_PUBLIC_SUPABASE_URL: '${url}',
+                  NEXT_PUBLIC_SUPABASE_ANON_KEY: '${key}',
+              } 
+          };
+      `;
   }
-  if (!entryFile) {
-      entryFile = files.find(f => f.path.endsWith('.tsx') || f.path.endsWith('.jsx') || f.path.endsWith('.js'));
-  }
 
-  // Normalize entry path
-  let entryPath = entryFile ? entryFile.path.replace(/^\.?\//, '') : '';
+  // Build File Map for Runtime
+  const fileMap: Record<string, string> = {};
+  processedFiles.forEach(f => {
+      fileMap[f.path] = f.content;
+      // Allow resolving 'src/App.tsx' as just 'App' inside src
+      if (f.path.startsWith('src/')) {
+          fileMap[f.path.substring(4)] = f.content;
+      }
+  });
 
-  // Pre-process files into a JSON map
-  const fileMap = files.reduce((acc, file) => {
-    const cleanPath = file.path.replace(/^\.?\//, '');
-    acc[cleanPath] = file.content;
-    return acc;
-  }, {} as Record<string, string>);
+  // Inject CSS
+  const styles = processedFiles.filter(f => f.path.endsWith('.css')).map(f => f.content).join('\n');
+  const styleTag = `<style>${styles}</style>`;
+  baseHtmlContent = baseHtmlContent.replace('</head>', `${styleTag}\n</head>`);
 
-  return `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <script src="https://cdn.tailwindcss.com"></script>
+  // Safely serialize fileMap using robust escaping for script contexts
+  const safeFileMapJson = safeJsonStringify(fileMap);
+
+  // 5. Inject Runtime
+  // If entry point exists, we bootstrap it.
+  const entryScript = entryPoint ? `__require('${entryPoint}');` : '';
+
+  const injectedScripts = `
+    <!-- Runtime Globals -->
     <script>
-        tailwind.config = {
-            theme: { extend: { colors: { primary: '#3b82f6' } } }
-        };
-        window.process = { env: { NODE_ENV: 'development' } };
-        ${projectIdInjection}
+      ${envInjection}
+      ${projectIdInjection}
+      
+      window.onerror = function(msg, url, line, col, error) {
+          window.parent.postMessage({ type: 'RUNTIME_ERROR', message: msg + (error ? '\\n' + error.stack : '') }, '*');
+      };
     </script>
-    <!-- React & DOM -->
+
+    <!-- Dependencies -->
     <script crossorigin src="https://unpkg.com/react@18.2.0/umd/react.development.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.development.js"></script>
-    <!-- Babel -->
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    <!-- Supabase -->
-    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-    <!-- Router -->
-    <script crossorigin src="https://unpkg.com/history@5/umd/history.development.js"></script>
+    <script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+    <script crossorigin src="https://unpkg.com/history@5.3.0/umd/history.development.js"></script>
     <script crossorigin src="https://unpkg.com/react-router@6.3.0/umd/react-router.development.js"></script>
     <script crossorigin src="https://unpkg.com/react-router-dom@6.3.0/umd/react-router-dom.development.js"></script>
-    <!-- Icons -->
-    <script src="https://unpkg.com/lucide-react@latest/dist/umd/lucide-react.min.js"></script>
+    <!-- Use stable Lucide React UMD v0.294.0 -->
+    <script src="https://unpkg.com/lucide-react@0.294.0/dist/umd/lucide-react.min.js"></script>
+    <script src="https://unpkg.com/clsx@2.0.0/dist/clsx.min.js"></script>
+    <script src="https://unpkg.com/tailwind-merge@2.2.0/dist/bundle.min.js"></script>
     
-    <style>
-      html, body, #root { height: 100%; margin: 0; padding: 0; background-color: #ffffff; }
-      #error-overlay { display: none; position: fixed; inset: 0; background: rgba(255,255,255,0.95); z-index: 9999; padding: 2rem; color: #ef4444; font-family: monospace; overflow: auto; pointer-events: none; }
-      #error-overlay * { pointer-events: auto; }
-    </style>
-</head>
-<body>
-    <div id="root"></div>
-    <div id="error-overlay"></div>
-
+    <!-- Force Tailwind CDN to ensure styling works even if index.html is missing it -->
+    <script src="https://cdn.tailwindcss.com"></script>
     <script>
-      // --- ERROR HANDLER ---
-      window.onerror = function(msg, url, line, col, error) {
-        if (msg === 'ResizeObserver loop limit exceeded') return;
-        
-        // Forcefully ignore Router context errors as they are often false positives in this shimmed env
-        if (typeof msg === 'string' && (
-            msg.includes('useRoutes() may be used only in the context of a <Router>') || 
-            msg.includes('useNavigate() may be used only in the context of a <Router>') ||
-            msg.includes('useLocation() may be used only in the context of a <Router>')
-        )) {
-            console.warn('Suppressing Router context error (False Positive):', msg);
-            return true;
-        }
-
-        const overlay = document.getElementById('error-overlay');
-        overlay.style.display = 'block';
-        overlay.innerHTML = '<h3 style="font-size:1.2rem;font-weight:bold;margin-bottom:1rem">Runtime Error</h3>' +
-                            '<pre style="background:#fee2e2;padding:1rem;border-radius:0.5rem;white-space:pre-wrap">' + msg + '\\n\\n' + (error ? error.stack : '') + '</pre>';
-        console.error('Runtime Error:', error);
-        window.parent.postMessage({ type: 'RUNTIME_ERROR', message: msg }, '*');
-        return false;
-      };
-      
-      window.addEventListener('unhandledrejection', function(event) {
-        window.onerror(event.reason.message, '', 0, 0, event.reason);
-      });
-
-      // --- SAFE PROXY ---
-      const createSafeProxy = (target, moduleName) => {
-        return new Proxy(target || {}, {
-            get: (t, prop) => {
-                if (prop in t) return t[prop];
-                if (prop === 'default') return createSafeProxy(t, moduleName);
-                if (prop === '__esModule') return true;
-                if (typeof prop === 'string' && /^[A-Z]/.test(prop)) {
-                    return (props) => window.React.createElement(
-                        'div',
-                        { 
-                            style: { color: '#b91c1c', border: '1px dashed #ef4444', padding: '4px', fontSize: '10px' },
-                            title: \`Missing: \${moduleName}.\${prop}\`
-                        },
-                        prop
-                    );
-                }
-                return undefined;
+      tailwind.config = {
+        theme: {
+          extend: {
+            fontFamily: {
+              sans: ['Vazirmatn', 'Inter', 'sans-serif'],
             }
-        });
-      };
+          }
+        }
+      }
+    </script>
 
-      // --- MODULE SYSTEM ---
-      window.__MODULES__ = {}; 
-      window.__SOURCES__ = ${JSON.stringify(fileMap)}; 
+    <!-- Module Loader -->
+    <script>
+      window.__SOURCES__ = ${safeFileMapJson};
+      window.__MODULES__ = {};
 
       function resolvePath(base, relative) {
-        if (!relative.startsWith('.')) return relative; 
-        const stack = base.split('/');
-        stack.pop(); 
-        const parts = relative.split('/');
-        for (let i = 0; i < parts.length; i++) {
-          if (parts[i] === '.') continue;
-          if (parts[i] === '..') stack.pop();
-          else stack.push(parts[i]);
-        }
-        return stack.join('/');
+          if (!relative.startsWith('.')) return relative;
+          const stack = base.split('/');
+          stack.pop();
+          const parts = relative.split('/');
+          for (let i = 0; i < parts.length; i++) {
+              if (parts[i] === '.') continue;
+              if (parts[i] === '..') stack.pop();
+              else stack.push(parts[i]);
+          }
+          return stack.join('/');
       }
 
-      function getFileContent(path) {
-         if (window.__SOURCES__[path]) return { content: window.__SOURCES__[path], finalPath: path };
-         const extensions = ['.tsx', '.ts', '.jsx', '.js', '.css', '.json'];
-         for (let ext of extensions) {
-             if (window.__SOURCES__[path + ext]) return { content: window.__SOURCES__[path + ext], finalPath: path + ext };
-         }
-         for (let ext of extensions) {
-             if (window.__SOURCES__[path + '/index' + ext]) return { content: window.__SOURCES__[path + '/index' + ext], finalPath: path + '/index' + ext };
-         }
-         return null;
-      }
+      function __require(path, base = 'src/main.tsx') {
+          const cleanPath = path.replace(/^node:/, '').trim();
 
-      window.require = function(path, base = '') {
-        // --- BUILT-INS ---
-        if (path === 'react') return window.React;
-        if (path === 'react-dom') return window.ReactDOM;
-        if (path === 'react-dom/client') return window.ReactDOM;
-        if (path === '@supabase/supabase-js') return window.supabase || createSafeProxy({}, '@supabase/supabase-js');
-        if (path === 'lucide-react') return window.lucide || createSafeProxy({}, 'lucide-react');
-        
-        // --- ROUTER SHIM (STRICT FIX) ---
-        if (path === 'react-router-dom' || path === 'react-router') {
-            const rrd = window.ReactRouterDOM || {};
-            const Passthrough = ({ children }) => children;
-            return {
-                ...rrd,
-                BrowserRouter: Passthrough,
-                HashRouter: Passthrough,
-                MemoryRouter: Passthrough,
-            };
-        }
+          // Built-ins (Return Safe Objects)
+          if (cleanPath === 'react') return window.React || { createElement: () => null };
+          if (cleanPath === 'react-dom') return window.ReactDOM || { createRoot: () => ({ render: () => {} }) };
+          if (cleanPath === 'react-dom/client') return window.ReactDOM || { createRoot: () => ({ render: () => {} }) };
+          
+          // Enhanced Router Shim: Alias BrowserRouter to HashRouter for iframe compat
+          if (cleanPath === 'react-router-dom') {
+              const lib = window.ReactRouterDOM;
+              if (!lib) return { BrowserRouter: ({children}) => children, HashRouter: ({children}) => children, Routes: () => null, Route: () => null };
+              return { ...lib, BrowserRouter: lib.HashRouter };
+          }
 
-        const resolvedPath = resolvePath(base, path);
-        const fileInfo = getFileContent(resolvedPath);
-        if (!fileInfo) {
-            console.warn('Module not found:', path, 'Resolved:', resolvedPath);
-            return createSafeProxy({}, path); 
-        }
-        
-        const { content, finalPath } = fileInfo;
-        
-        // 1. Check Cache
-        if (window.__MODULES__[finalPath]) return window.__MODULES__[finalPath].exports;
+          if (cleanPath === '@supabase/supabase-js') return window.supabase || { createClient: () => ({}) };
+          
+          // Library Support Shims
+          if (cleanPath === 'lucide-react' || cleanPath.startsWith('lucide-react/')) {
+             let lib = window.lucideReact || window.lucide;
+             if (!lib) {
+                 console.warn('lucide-react not loaded, using fallback proxy');
+                 lib = new Proxy({}, {
+                     get: (target, prop) => {
+                         if (prop === '__esModule') return true;
+                         return (props) => window.React ? window.React.createElement('span', { 'data-icon': String(prop) }, '') : null;
+                     }
+                 });
+             }
+             if (!lib.default) {
+                 lib.default = lib;
+             }
+             return lib;
+          }
+          
+          if (cleanPath === 'clsx') {
+              const f = window.clsx || (() => '');
+              return { clsx: f, default: f };
+          }
+          if (cleanPath === 'tailwind-merge') return window.twMerge || { twMerge: (s) => s };
 
-        if (finalPath.endsWith('.css')) {
-            const style = document.createElement('style');
-            style.textContent = content;
-            document.head.appendChild(style);
-            window.__MODULES__[finalPath] = { exports: {} };
-            return {};
-        }
-
-        if (finalPath.endsWith('.json')) {
-             try {
-                 const json = JSON.parse(content);
-                 window.__MODULES__[finalPath] = { exports: json };
-                 return json;
-             } catch(e) {}
-        }
-
-        // --- COMPILATION (CIRCULAR DEP FIX) ---
-        // 2. Register Module EARLY to support circular dependencies
-        const module = { exports: {} };
-        window.__MODULES__[finalPath] = module;
-
-        try {
-            // Guard: Check for hallucinated text files acting as code
-            if (content.trim().indexOf('import ') !== 0 && content.trim().indexOf('export ') === -1 && content.trim().indexOf('<') === -1) {
-                 if (content.length < 500 && (content.includes('Remove') || content.includes('Note:') || content.includes('Instructions:'))) {
-                     throw new Error("File content appears to be text instructions, not code.");
-                 }
-            }
-
-            const presets = [['env', { modules: 'commonjs' }], 'react'];
-            if (finalPath.endsWith('.ts') || finalPath.endsWith('.tsx')) {
-                presets.push('typescript');
-            }
-            const transformed = Babel.transform(content, { presets, filename: finalPath }).code;
-            
-            const wrapper = new Function('module', 'exports', 'require', transformed);
-            wrapper(module, module.exports, (p) => window.require(p, finalPath));
-            
-            return module.exports;
-        } catch (e) {
-            console.error('Compilation Error in ' + finalPath, e);
-            const ErrorComponent = () => window.React.createElement('div', { 
-                style: { color: 'red', padding: 10, background: '#fee2e2', border: '1px solid red' } 
-            }, 'Error compiling ' + finalPath + ': ' + e.message);
-            // Update the cache with the error component so we don't retry infinite loops
-            window.__MODULES__[finalPath].exports = { default: ErrorComponent, ErrorComponent }; 
-            return window.__MODULES__[finalPath].exports;
-        }
-      };
-
-      // --- BOOTSTRAP ---
-      window.onload = function() {
-          try {
-              const rootEl = document.getElementById('root');
-              if (!rootEl) throw new Error("Missing #root element");
-
-              // 1. AUTO-DETECT APP COMPONENT
-              const appFile = ['src/App.tsx', 'src/App.jsx', 'src/App.js', 'App.tsx', 'App.jsx', 'App.js'].find(p => window.__SOURCES__[p]);
-              let mounted = false;
-
-              if (appFile) {
-                  try {
-                      const mod = window.require(appFile);
-                      // Support both default and named 'App' exports
-                      const App = mod.default || mod.App;
-                      
-                      if (App) {
-                          const React = window.React;
-                          const ReactDOM = window.ReactDOM;
-                          // Use REAL HashRouter from global UMD for the root context
-                          const RealHashRouter = window.ReactRouterDOM.HashRouter;
-                          
-                          const root = ReactDOM.createRoot(rootEl);
-                          root.render(React.createElement(RealHashRouter, {}, React.createElement(App)));
-                          mounted = true;
-                          console.log('Mounted App via ' + appFile);
-                      } else {
-                          throw new Error("App component not found in exports. Ensure 'export default App' or 'export const App'.");
+          // Resolve
+          let resolved = resolvePath(base, cleanPath);
+          const extensions = ['', '.tsx', '.ts', '.jsx', '.js', '.css', '.json'];
+          let finalPath = null;
+          
+          if (window.__SOURCES__[resolved]) finalPath = resolved;
+          else {
+              for (const ext of extensions) {
+                  if (window.__SOURCES__[resolved + ext]) {
+                      finalPath = resolved + ext;
+                      break;
+                  }
+              }
+              if (!finalPath) {
+                  // Fallback: try searching in src/ if bare import
+                  if (window.__SOURCES__['src/' + cleanPath]) return __require('src/' + cleanPath, base);
+                  
+                  // Index resolution
+                  for (const ext of extensions) {
+                      if (window.__SOURCES__[resolved + '/index' + ext]) {
+                          finalPath = resolved + '/index' + ext;
+                          break;
                       }
-                  } catch(e) {
-                      console.warn('Auto-mount failed:', e);
-                      throw e; // Re-throw to show error overlay
                   }
               }
+          }
 
-              // 2. FALLBACK: EXECUTE ENTRY FILE (main.tsx)
-              if (!mounted) {
-                  const entry = "${entryPath}";
-                  if (entry && window.__SOURCES__[entry]) {
-                      console.log('Executing entry: ' + entry);
-                      window.require(entry);
-                  } else if (!appFile) {
-                      document.body.innerHTML = '<div style="padding:20px;color:#64748b;">Waiting for entry point...</div>';
-                  }
-              }
+          if (!finalPath) {
+              console.warn('Module not found:', cleanPath, 'resolved to:', resolved);
+              return {}; 
+          }
+
+          if (window.__MODULES__[finalPath]) return window.__MODULES__[finalPath].exports;
+
+          const source = window.__SOURCES__[finalPath];
+          const module = { exports: {} };
+          window.__MODULES__[finalPath] = module;
+
+          if (finalPath.endsWith('.css')) return {};
+          if (finalPath.endsWith('.json')) {
+              try {
+                  module.exports = JSON.parse(source);
+              } catch(e) { module.exports = {}; }
+              return module.exports;
+          }
+
+          try {
+              const presets = [['env', { modules: 'commonjs' }], 'react'];
+              if (finalPath.endsWith('.ts') || finalPath.endsWith('.tsx')) presets.push('typescript');
+              
+              const code = Babel.transform(source, { 
+                  presets, 
+                  filename: finalPath,
+                  retainLines: true
+              }).code;
+              
+              const func = new Function('require', 'module', 'exports', 'React', code);
+              func(
+                  (p) => __require(p, finalPath), 
+                  module, 
+                  module.exports, 
+                  window.React
+              );
+          } catch (e) {
+              console.error('Error executing ' + finalPath, e);
+              // Report to parent
+              window.onerror('Compilation Error in ' + finalPath + ': ' + e.message, finalPath, 0, 0, e);
+              throw e;
+          }
+
+          return module.exports;
+      }
+
+      window.addEventListener('DOMContentLoaded', () => {
+          try {
+              ${entryScript}
           } catch (e) {
               console.error('Bootstrap Error:', e);
-              window.onerror(e.message, '', 0, 0, e);
+              document.body.innerHTML = '<div style="color:#ef4444;padding:2rem;font-family:sans-serif;"><h3>Runtime Error</h3><p>Failed to execute application.</p><pre style="background:#1e293b;color:#e2e8f0;padding:1rem;border-radius:0.5rem;overflow:auto;">' + e.message + '</pre></div>';
           }
-      };
-
+      });
     </script>
-</body>
-</html>
   `;
-};
 
-// Legacy Single File Fallback (kept for stability of old projects)
-const constructSingleFileDocument = (code: GeneratedCode, projectId?: string): string => {
-  let rawJs = code.javascript || '';
-  rawJs = rawJs.replace(/^```javascript/gm, '').replace(/^```tsx/gm, '').replace(/^```/gm, '');
-
-  if (rawJs.includes('<Route') && !rawJs.includes('<Routes')) {
-      if (rawJs.includes('<HashRouter>')) {
-          rawJs = rawJs.replace(/<HashRouter>/g, '<HashRouter><Routes>');
-          rawJs = rawJs.replace(/<\/HashRouter>/g, '</Routes></HashRouter>');
-      } 
+  // Use case-insensitive replace for </body>
+  if (/<\/body>/i.test(baseHtmlContent)) {
+      return baseHtmlContent.replace(/<\/body>/i, `${injectedScripts}</body>`);
+  } else {
+      return `${baseHtmlContent}\n${injectedScripts}`;
   }
-
-  const projectIdInjection = projectId ? `window.__PROJECT_ID__ = "${projectId}";` : 'window.__PROJECT_ID__ = null;';
-
-  return `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <style>
-        html, body { height: 100%; width: 100%; margin: 0; padding: 0; overflow: hidden; }
-        body { font-family: sans-serif; background-color: #ffffff; color: #1f2937; }
-        #root { width: 100%; height: 100%; overflow: auto; }
-        #error-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(254, 226, 226, 0.95); color: #991b1b; z-index: 9999; padding: 2rem; box-sizing: border-box; }
-        ${code.css || ''}
-    </style>
-    <script>
-        window.process = { env: { NODE_ENV: 'development' } };
-        ${projectIdInjection}
-        window.showError = function(type, message) {
-            const overlay = document.getElementById('error-overlay');
-            if (overlay) { overlay.style.display = 'block'; overlay.innerText = type + ': ' + message; }
-            window.parent.postMessage({ type: 'RUNTIME_ERROR', message: type + ": " + message }, '*');
-        };
-        window.onerror = function(msg, url, line, col, error) { window.showError('Runtime Error', msg); return true; };
-    </script>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-    <script crossorigin src="https://unpkg.com/history@5/umd/history.development.js"></script>
-    <script crossorigin src="https://unpkg.com/react-router@6.3.0/umd/react-router.development.js"></script>
-    <script crossorigin src="https://unpkg.com/react-router-dom@6.3.0/umd/react-router-dom.development.js"></script>
-    <script src="https://unpkg.com/lucide-react@latest/dist/umd/lucide-react.min.js"></script>
-</head>
-<body>
-    <div id="root"></div>
-    <div id="error-overlay"></div>
-    <script type="text/plain" id="user-code">${rawJs}</script>
-    <script>
-        const createSafeProxy = (target, name) => new Proxy(target || {}, { 
-            get: (t, p) => {
-                if (p in t) return t[p];
-                if (p === 'default') return createSafeProxy(t, name);
-                return (props) => window.React.createElement('div', { style: { color: 'red', border: '1px dashed red', padding: '2px', display: 'inline-block' } }, name + '.' + String(p));
-            } 
-        });
-        
-        if(window.supabase) { window.createClient = window.supabase.createClient; }
-        window.lucideReact = window.lucide || createSafeProxy({}, 'lucide');
-        window.ReactRouterDOM = window.ReactRouterDOM || createSafeProxy({}, 'ReactRouterDOM');
-        
-        window.require = function(name) {
-            if (name === 'react') return window.React;
-            if (name === 'react-dom') return window.ReactDOM;
-            if (name === 'react-dom/client') return window.ReactDOM;
-            if (name === 'react-router-dom') return window.ReactRouterDOM;
-            if (name === '@supabase/supabase-js') return window.supabase;
-            if (name === 'lucide-react') return window.lucideReact;
-            return createSafeProxy({}, name);
-        };
-        (function() {
-            const { HashRouter, MemoryRouter, useNavigate, useLocation } = window.ReactRouterDOM;
-            const React = window.React;
-            const UnifiedRouter = ({ children }) => {
-                const RouterComponent = HashRouter || (({children}) => React.createElement('div', {}, children));
-                return React.createElement(RouterComponent, {}, children);
-            };
-            window.ReactRouterDOM.HashRouter = UnifiedRouter;
-            window.ReactRouterDOM.BrowserRouter = UnifiedRouter;
-        })();
-        (function() {
-            try {
-                const rawCode = document.getElementById('user-code').textContent;
-                const compiled = Babel.transform(rawCode, { presets: [['env', { modules: 'umd' }], 'react'], filename: 'main.tsx' }).code;
-                eval(compiled);
-            } catch (e) { window.showError(e.name, e.message); }
-        })();
-    </script>
-</body>
-</html>
-  `;
-};
-
-export const createDeployableBlob = (code: GeneratedCode, projectId?: string): string => {
-  const fullHtml = constructFullDocument(code, projectId);
-  const blob = new Blob([fullHtml], { type: 'text/html' });
-  return URL.createObjectURL(blob);
 };

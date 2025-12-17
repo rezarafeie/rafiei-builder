@@ -104,7 +104,7 @@ class WebhookService {
         }
 
         try {
-            const { data } = await supabase.auth.getSession();
+            const { data } = await (supabase.auth as any).getSession();
             if (data.session?.user) {
                 return {
                     user_id: data.session.user.id,

@@ -52,6 +52,10 @@ export const billingService = {
         return inputCost + outputCost;
     },
 
+    calculateCredits(usdCost: number): number {
+        return usdCost * CREDITS_PER_USD;
+    },
+
     async checkBalance(userId: string, minRequired: number = 0.1): Promise<boolean> {
         const { data, error } = await supabase.from('user_settings').select('credits_balance').eq('user_id', userId).single();
         if (error) {
@@ -92,7 +96,8 @@ export const billingService = {
         });
 
         if (error) {
-            console.error("Billing Charge Failed:", error);
+            const errStr = error.message || JSON.stringify(error);
+            console.error(`Billing Charge Failed: ${errStr}`);
             return 0;
         }
         

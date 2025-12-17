@@ -250,7 +250,7 @@ export const paymentService = {
             const json = await res.json();
 
             if (json.data && (json.data.code === 100 || json.data.code === 101)) {
-                const { data: { user } } = await supabase.auth.getUser();
+                const { data: { user } } = await (supabase.auth as any).getUser();
                 if (!user) throw new Error("User not authenticated");
 
                 await this.finalizePayment(user.id, {
@@ -268,8 +268,10 @@ export const paymentService = {
                 webhookService.send('credit.purchase_failed', { error: `Verification code ${json.data?.code}`, gateway: 'Zarinpal', authority });
                 return { success: false, message: `Verification Failed: Code ${json.data?.code}` };
             }
-        } catch (e: any) {
-            return { success: false, message: e.message || "Verification network error" };
+        } catch (e: unknown) {
+            // Safely extract message from unknown error
+            const errorMessage = e instanceof Error ? e.message : String(e);
+            return { success: false, message: errorMessage || "Verification network error" };
         }
     },
 

@@ -72,21 +72,11 @@ const CreditBalanceModal: React.FC<CreditBalanceModalProps> = ({ user, onClose }
                 const url = await paymentService.requestZarinpalPayment(amount, user.email, ''); // Mobile optional
                 window.location.href = url; // Redirect to Payment Gateway
             } else {
-                // Stripe Flow (Simulated for Demo as we lack backend intent creation)
-                // Note: Using a restricted key on frontend is risky, so we simulate the success here.
-                await new Promise(resolve => setTimeout(resolve, 1500));
-                
-                await paymentService.finalizePayment(user.id, {
-                    amount: amount,
-                    currency: 'USD',
-                    exchangeRate: 1,
-                    gateway: 'Stripe',
-                    paymentId: `stp_${Date.now()}` // Simulated ID
-                });
-                
-                alert(`${t('successfullyAdded')} ${amount} ${t('credits')}!`);
-                onClose();
-                window.location.reload(); 
+                // Disable insecure Stripe simulation. 
+                // A secure implementation requires a backend endpoint to create a PaymentIntent.
+                alert("Stripe payments are currently disabled in this demo environment. Please use Zarinpal or contact support.");
+                setIsProcessing(false);
+                return;
             }
         } catch (e: any) {
             setPurchaseError(e.message);
