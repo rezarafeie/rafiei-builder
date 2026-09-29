@@ -1,20 +1,35 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# Rafiei Builder
 
-# Run and deploy your AI Studio app
+An AI-powered application builder focused on turning product ideas into working software through conversational generation workflows.
 
-This contains everything you need to run your app locally.
+## Overview
+Rafiei Builder explores an AI-native development experience where users can describe applications, generate product structures and work with persistent project data from a single interface.
 
-View your app in AI Studio: https://ai.studio/apps/drive/16y4cdwSSYPbgn6pPIAoQ8rq41YnjHEIs
+## Engineering Highlights
+- AI-assisted application generation workflows
+- Google Gemini integration through the GenAI SDK
+- Supabase-backed project and application data
+- React-based product interface with client-side routing
+- TypeScript-first codebase
+- Designed as a foundation for a broader AI builder ecosystem
 
-## Run Locally
+## Tech Stack
+**Frontend:** React 19, TypeScript, Vite  
+**AI:** Google GenAI / Gemini  
+**Backend & Data:** Supabase  
+**Routing:** React Router  
+**UI:** Lucide React
 
-**Prerequisites:**  Node.js
+## Local Development
+```bash
+npm install
+npm run dev
+```
 
+Configure the required environment variables before starting the development server.
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+## Product Direction
+The project is part of a broader effort to build AI-native tools that reduce the distance between an idea and a deployable digital product.
+
+---
+Built by Reza Rafiei.
